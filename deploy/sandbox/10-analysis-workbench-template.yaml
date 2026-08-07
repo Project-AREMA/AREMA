@@ -1,0 +1,101 @@
+# Analysis-workbench sandbox template.
+#
+# A warm, exec-driven container hosting python3 + radare2/r2pipe + static-analysis
+# libraries for scripted static unpacking. It exposes no network service; AREMA
+# drives it through kubectl exec. Hostile bytes are only read statically, never
+# executed, but a native parser RCE is still possible, so the pod is hardened:
+# non-root fixed UID, dropped caps, read-only rootfs (writable emptyDirs at /work
+# and /tmp only), a seccomp profile, and a hard memory ceiling.
+#
+# Egress: the PRIMARY deny-all egress is spec.networkPolicy below -- the framework
+# (networkPolicyManagement: Managed) generates a NetworkPolicy from it that selects
+# warm-pool pods by their sandbox-template-ref-hash label. Without it, the
+# framework's DEFAULT managed policy ALLOWS internet egress, which additively
+# negates any standalone deny-all (K8s policies are OR-combined). The separate
+# 30-analysis-workbench-denyall-egress.yaml (arema.dev/pool selector) is a
+# defense-in-depth second layer. Both need a policy-enforcing CNI (Calico, which
+# install-agent-sandbox.sh provisions); kindnet ignores NetworkPolicy.
+#
+# Runtime isolation: before running hostile code in production, set
+# spec.podTemplate.spec.runtimeClassName to gvisor or kata -- same convention as
+# the other engine templates. It is intentionally NOT hard-set here: the fleet
+# runs under the default runtime on the reference Kind cluster (which provisions
+# no gvisor/kata RuntimeClass), and provisioning a hardened runtime is a
+# fleet-wide production-deployment concern applied at deploy time, not a per-pod
+# base-template setting. Static-only Phase 0 needs no runtime isolation to run.
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxTemplate
+metadata:
+  name: analysis-workbench-runtime-template
+  namespace: agent-sandbox-demo
+spec:
+  # The agent-sandbox framework (networkPolicyManagement: Managed, the default)
+  # GENERATES a NetworkPolicy for this template's pods, selecting them by their
+  # agents.x-k8s.io/sandbox-template-ref-hash label. Its DEFAULT (when this field
+  # is unset) ALLOWS egress to the whole internet (0.0.0.0/0 minus private ranges)
+  # -- unacceptable for a pod that statically decrypts live malware, and it
+  # additively NEGATES any standalone deny-all NetworkPolicy (K8s policies are
+  # OR-combined). Declare deny-all here so the managed policy -- the only one that
+  # reliably selects controller-created warm-pool pods -- actually blocks
+  # exfiltration. Ingress is denied too: the workbench exposes no service and is
+  # driven purely through kubectl exec (which does not traverse the pod network).
+  networkPolicy:
+    egress: []
+    ingress: []
+  podTemplate:
+    metadata:
+      labels:
+        arema.dev/pool: analysis-workbench
+    spec:
+      restartPolicy: OnFailure
+      automountServiceAccountToken: false
+      # Fully-offline sandbox: it resolves no hostnames. Under the deny-all egress
+      # above, DNS queries to kube-dns are DROPPED (not refused), so any tool that
+      # does a hostname lookup (e.g. ilspycmd resolving a symbol/reference server,
+      # NuGet reaching nuget.org) would HANG for minutes on the search-domain
+      # timeout chain instead of failing fast. Point DNS at a non-listening
+      # resolver with a 1s/1-attempt/ndots:1 budget so every lookup fails
+      # immediately and tools fall back to their offline paths.
+      dnsPolicy: None
+      dnsConfig:
+        nameservers: ["127.0.0.1"]
+        options:
+          - { name: ndots, value: "1" }
+          - { name: timeout, value: "1" }
+          - { name: attempts, value: "1" }
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: analysis-workbench
+          image: arema-analysis-workbench:0.1.0
+          imagePullPolicy: IfNotPresent
+          # Driven through kubectl exec, so readiness only validates the toolchain
+          # and no container port is declared.
+          readinessProbe:
+            exec: { command: ["analysis-workbench-healthcheck"] }
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: work, mountPath: /work }
+            # readOnlyRootFilesystem makes /tmp read-only, but the .NET CLI's
+            # first-run configurer creates a named Mutex whose backing file lives
+            # under /tmp -- without a writable /tmp, dotnet/NuGet aborts with
+            # "cannot open the device or file specified : 'NuGet-Migrations'", so
+            # the managed toolchain (dotnet-script, ilspycmd) cannot run. A small
+            # writable emptyDir at /tmp fixes it without weakening the rootfs.
+            - { name: tmp, mountPath: /tmp }
+          resources:
+            requests: { cpu: "500m", memory: "1Gi" }
+            limits: { cpu: "2", memory: "4Gi" }
+      volumes:
+        - name: work
+          emptyDir: { sizeLimit: "2Gi" }
+        - name: tmp
+          emptyDir: { sizeLimit: "512Mi" }

@@ -1,0 +1,67 @@
+# jadx sandbox template (the Java/Android decompilation engine).
+#
+# Single-container pod running jadx, driven via raw `kubectl exec` (AREMA's
+# prepare_jadx copies the artifact in and decompiles it in one pass; the jadx_*
+# tools then read the resulting tree). There is no listening port and no MCP
+# port-forward, mirroring the ghidra-rpc / deobfuscation-tools templates rather
+# than the MCP ones.
+#
+# The readinessProbe is an exec probe (`jadx --version`) since this pod exposes
+# no socket. It proves the launcher, the JVM and the jadx jars are all wired.
+#
+# Before hostile code, set spec.podTemplate.spec.runtimeClassName to gvisor/kata.
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxTemplate
+metadata:
+  name: jadx-runtime-template
+  namespace: agent-sandbox-demo
+spec:
+  # Deny all ingress + egress: this pool statically decompiles live malware and
+  # needs no network. The agent-sandbox framework's DEFAULT managed policy ALLOWS
+  # internet egress (see analysis-workbench + LESSONS_LEARNED #15), so declare
+  # empty rules to make the managed policy deny both. This pool is
+  # kubectl-exec-driven (no port), so deny-all ingress has no effect on how the
+  # agent reaches it.
+  networkPolicy:
+    egress: []
+    ingress: []
+  podTemplate:
+    metadata:
+      labels:
+        arema.dev/pool: jadx
+    spec:
+      restartPolicy: OnFailure
+      automountServiceAccountToken: false
+      # Offline sandbox: fail DNS fast so a hostname lookup fails instantly
+      # instead of hanging on the deny-all egress DROP.
+      dnsPolicy: None
+      dnsConfig:
+        nameservers: ["127.0.0.1"]
+        options:
+          - { name: ndots, value: "1" }
+          - { name: timeout, value: "1" }
+          - { name: attempts, value: "1" }
+      securityContext:
+        runAsNonRoot: true
+      containers:
+        - name: jadx
+          image: arema-jadx:0.1.0
+          imagePullPolicy: IfNotPresent
+          # This pod is driven through kubectl exec, so readiness only validates
+          # the jadx launcher and no container port is declared.
+          readinessProbe:
+            exec:
+              command: ["jadx", "--version"]
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          # Decompiling a large APK is CPU-bound and heap-hungry; the limit has to
+          # stay above the -Xmx3g the image sets or the JVM is killed mid-run.
+          resources:
+            requests: { cpu: "500m", memory: "1Gi" }
+            limits: { cpu: "2", memory: "4Gi" }

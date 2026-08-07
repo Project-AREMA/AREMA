@@ -1,0 +1,79 @@
+# radare2-mcp sandbox template (Spec B, B.1).
+#
+# Single-container pod running the radare2-mcp HTTP MCP server on :8765, reached
+# by ADK StreamableHTTP through the sandbox-router (X-Sandbox-Port: 8765). This
+# proves the r2mcp transport end-to-end. The playground container (python-runtime,
+# for artifact upload via /app) + the shared /app volume are added in B.2, where
+# artifact upload is needed -- the runtime's /app holds its own server code, so the
+# shared volume needs a dedicated artifacts subpath, solved then.
+#
+# Before hostile code, set spec.podTemplate.spec.runtimeClassName to gvisor/kata.
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxTemplate
+metadata:
+  name: radare2-mcp-runtime-template
+  namespace: agent-sandbox-demo
+spec:
+  # Deny all ingress + egress: this pool statically analyses live malware and needs
+  # no network. The agent-sandbox framework's DEFAULT managed policy ALLOWS internet
+  # egress (see analysis-workbench + LESSONS_LEARNED #15), so declare empty rules to
+  # make the managed policy deny both. The agent reaches :8765 via `kubectl
+  # port-forward`, which is kubelet-mediated (not pod-network ingress) and so is
+  # unaffected by deny-all ingress -- verified against a live warm-pool pod.
+  networkPolicy:
+    egress: []
+    ingress: []
+  podTemplate:
+    metadata:
+      labels:
+        arema.dev/pool: radare2-mcp
+    spec:
+      restartPolicy: OnFailure
+      automountServiceAccountToken: false
+      # Offline sandbox: fail DNS fast so a tool that does a hostname lookup fails
+      # instantly instead of hanging on the deny-all egress DROP.
+      dnsPolicy: None
+      dnsConfig:
+        nameservers: ["127.0.0.1"]
+        options:
+          - { name: ndots, value: "1" }
+          - { name: timeout, value: "1" }
+          - { name: attempts, value: "1" }
+      securityContext:
+        runAsNonRoot: true
+      containers:
+        - name: r2mcp
+          image: arema-radare2-mcp:0.1.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8765
+          # tcpSocket, not httpGet: with -A, r2mcp gates ALL requests (including
+          # GET /) with bearer auth, so an httpGet probe would get 401 and the pod
+          # would never go Ready. tcpSocket just checks :8765 is listening.
+          readinessProbe:
+            tcpSocket:
+              port: 8765
+            initialDelaySeconds: 1
+            periodSeconds: 2
+          livenessProbe:
+            tcpSocket:
+              port: 8765
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            # No memory limit: radare2's `aaa` auto-analysis (triggered by
+            # list_functions) must be free to grow past any fixed cap on a large
+            # or packed binary. A 1Gi cap OOM-kills (exit 137) the r2 process on a
+            # multi-MB packed .NET assembly, which silently drops the MCP session
+            # and stalls every sibling call to the read timeout. Same rationale as
+            # ghidra-rpc: the node has ample RAM, the request keeps the pod
+            # Burstable so the scheduler still reserves a floor, and CPU stays
+            # capped so a runaway analysis cannot starve the node.
+            requests: { cpu: "250m", memory: "1Gi" }
+            limits: { cpu: "1" }

@@ -1,0 +1,7 @@
+*
+!Dockerfile
+!healthcheck.sh
+!de4dot-wrapper
+!dotnet-script-wrapper
+!dnlib-smoke.csx
+!dnlib-roundtrip.csx

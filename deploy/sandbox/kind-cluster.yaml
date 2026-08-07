@@ -1,0 +1,24 @@
+# Kind cluster configuration for the AREMA sandbox.
+#
+# WHY THIS FILE EXISTS. The deny-all egress NetworkPolicy that isolates the
+# analysis-workbench pool (deploy/sandbox/30-analysis-workbench-denyall-egress.yaml)
+# is the load-bearing exfil-prevention backstop for a compromised run_python pod
+# (spec 5.1: "even a successful injection has no exfil path"). A NetworkPolicy is
+# ONLY enforced by a policy-enforcing CNI. Kind's default CNI (kindnet) silently
+# IGNORES NetworkPolicy objects, so on a stock `kind create cluster` the deny-all
+# egress is a no-op and the pod keeps a full network exfil path.
+#
+# This config disables the default CNI so that install-agent-sandbox.sh can
+# install Calico, which DOES enforce NetworkPolicy:
+#
+#   kind create cluster --config deploy/sandbox/kind-cluster.yaml   # or: make sandbox-cluster
+#   make setup-sandbox                                              # installs Calico + framework
+#   make sandbox-up && make sandbox-verify-egress                   # prove enforcement, not just presence
+#
+# podSubnet matches Calico's default IPv4 pool (192.168.0.0/16) so Calico IPAM
+# and the cluster agree on the pod CIDR.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+networking:
+  disableDefaultCNI: true
+  podSubnet: "192.168.0.0/16"

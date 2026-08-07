@@ -1,0 +1,59 @@
+# Deobfuscation-tools sandbox template.
+#
+# A warm, exec-driven container for stateless UPX and FLOSS commands. It exposes
+# no network service; AREMA drives the tools through kubectl exec. Before
+# processing hostile code, set spec.podTemplate.spec.runtimeClassName to gvisor
+# or kata.
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxTemplate
+metadata:
+  name: deobfuscation-tools-runtime-template
+  namespace: agent-sandbox-demo
+spec:
+  # Deny all ingress + egress: this pool statically analyses live malware and needs
+  # no network. The agent-sandbox framework's DEFAULT managed policy ALLOWS internet
+  # egress (see analysis-workbench + LESSONS_LEARNED #15), so declare empty rules to
+  # make the managed policy deny both. This pool is kubectl-exec-driven (no port), so
+  # deny-all ingress has no effect on how the agent reaches it.
+  networkPolicy:
+    egress: []
+    ingress: []
+  podTemplate:
+    metadata:
+      labels:
+        arema.dev/pool: deobfuscation-tools
+    spec:
+      restartPolicy: OnFailure
+      automountServiceAccountToken: false
+      # Offline sandbox: fail DNS fast so a hostname lookup (e.g. mono/de4dot or
+      # FLOSS reaching out) fails instantly instead of hanging on the deny-all
+      # egress DROP.
+      dnsPolicy: None
+      dnsConfig:
+        nameservers: ["127.0.0.1"]
+        options:
+          - { name: ndots, value: "1" }
+          - { name: timeout, value: "1" }
+          - { name: attempts, value: "1" }
+      securityContext:
+        runAsNonRoot: true
+      containers:
+        - name: deobfuscation-tools
+          image: arema-deobfuscation-tools:0.1.0
+          imagePullPolicy: IfNotPresent
+          # This pod is driven through kubectl exec, so readiness only validates
+          # its two CLI tools and no container port is declared.
+          readinessProbe:
+            exec:
+              command: ["deobfuscation-tools-healthcheck"]
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests: { cpu: "500m", memory: "1Gi" }
+            limits: { cpu: "2", memory: "4Gi" }

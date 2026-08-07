@@ -1,0 +1,9 @@
+#!/bin/sh
+# The analysis sandbox denies ALL egress (Calico DROPs packets, it does not
+# refuse them), so a NuGet restore that reaches out to nuget.org HANGS on the
+# dropped SYN for minutes instead of failing fast. Force every restore offline by
+# pointing NuGet at a local source: framework reference packs come from the SDK
+# and any needed runtime packages from the prewarmed global cache (NUGET_PACKAGES),
+# so nuget.org is never contacted. The unmodified tool is /opt/dotnet-tools/
+# dotnet-script.real (used at build time, egress open, to populate that cache).
+exec /opt/dotnet-tools/dotnet-script.real --sources /opt/nuget-offline "$@"

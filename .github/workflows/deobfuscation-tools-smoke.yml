@@ -1,0 +1,36 @@
+name: Deobfuscation tools image smoke
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/deobfuscation-tools-smoke.yml"
+      - "Makefile"
+      - "images/deobfuscation-tools/**"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/deobfuscation-tools-smoke.yml"
+      - "Makefile"
+      - "images/deobfuscation-tools/**"
+
+permissions:
+  contents: read
+
+jobs:
+  deobfuscation-tools-smoke:
+    name: Native ${{ matrix.architecture }} image smoke
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: amd64
+            runner: ubuntu-24.04
+          - architecture: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Build and smoke test image
+        run: |
+          docker build -t arema-deobfuscation-tools:0.1.0 images/deobfuscation-tools
+          images/deobfuscation-tools/smoke-test.sh

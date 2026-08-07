@@ -1,0 +1,82 @@
+# ghidra-rpc sandbox template (Spec B, B.4).
+#
+# Single-container pod running Ghidra + ghidra-rpc, driven via raw kubectl exec
+# (AREMA's prepare_ghidra starts the daemon + loads the binary; the ghidra_*
+# tools exec ghidra-rpc CLI commands). There is no python-runtime playground
+# /execute endpoint and no MCP port-forward — the kubectl-exec path mirrors
+# B.2's kubectl-cp pattern.
+#
+# The readinessProbe is an exec probe (ghidra-rpc --help) since this pod exposes
+# no listening port (it is driven over kubectl exec, not a network socket).
+#
+# Before hostile code, set spec.podTemplate.spec.runtimeClassName to gvisor/kata.
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxTemplate
+metadata:
+  name: ghidra-rpc-runtime-template
+  namespace: agent-sandbox-demo
+spec:
+  # Deny all ingress + egress: this pool statically analyses live malware and needs
+  # no network. The agent-sandbox framework's DEFAULT managed policy ALLOWS internet
+  # egress (see analysis-workbench + LESSONS_LEARNED #15), so declare empty rules to
+  # make the managed policy deny both. This pool is kubectl-exec-driven (no port), so
+  # deny-all ingress has no effect on how the agent reaches it.
+  networkPolicy:
+    egress: []
+    ingress: []
+  podTemplate:
+    metadata:
+      labels:
+        arema.dev/pool: ghidra-rpc
+    spec:
+      restartPolicy: OnFailure
+      automountServiceAccountToken: false
+      # Offline sandbox: fail DNS fast so a hostname lookup (e.g. a Ghidra/JVM
+      # update or telemetry check) fails instantly instead of hanging on the
+      # deny-all egress DROP.
+      dnsPolicy: None
+      dnsConfig:
+        nameservers: ["127.0.0.1"]
+        options:
+          - { name: ndots, value: "1" }
+          - { name: timeout, value: "1" }
+          - { name: attempts, value: "1" }
+      securityContext:
+        runAsNonRoot: true
+      containers:
+        - name: ghidra-rpc
+          image: arema-ghidra-rpc:0.1.0
+          imagePullPolicy: IfNotPresent
+          # Exec probe: no listening port (the pod is driven over kubectl exec,
+          # not a network socket). --help only needs the CLI to import + parse,
+          # which proves ghidra-rpc + the JVM + GHIDRA_INSTALL_DIR are wired.
+          readinessProbe:
+            exec:
+              command: ["ghidra-rpc", "--help"]
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          env:
+            # Ghidra ships no MAXMEM override, so pyghidra's JVM falls back to the
+            # JDK cgroup ergonomic (MaxRAMPercentage=25% -> ~1Gi under a 4Gi cap).
+            # A 1Gi heap plus Ghidra's native C++ decompiler (a subprocess spawned
+            # per function) OOM-kills (exit 137) while decompiling binaries with
+            # hundreds of functions, starving the whole deep-analysis chain. Give
+            # the heap an explicit, generous ceiling. _JAVA_OPTIONS takes final
+            # precedence over any -Xmx pyghidra/Ghidra might set, and the "Picked
+            # up _JAVA_OPTIONS" banner goes to stderr, which kubectl_exec discards
+            # (it parses stdout only), so it cannot corrupt tool JSON.
+            - name: _JAVA_OPTIONS
+              value: "-Xmx12g"
+          resources:
+            # No memory limit: the JVM heap above plus the off-heap native
+            # decompiler must be free to grow past any fixed cap on large binaries.
+            # The node has ample RAM; the request keeps the pod Burstable so the
+            # scheduler still reserves a floor. CPU stays capped.
+            requests: { cpu: "500m", memory: "4Gi" }
+            limits: { cpu: "2" }

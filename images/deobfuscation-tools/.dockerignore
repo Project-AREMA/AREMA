@@ -1,0 +1,7 @@
+*
+!Dockerfile
+!healthcheck.sh
+!build-requirements.lock
+!requirements.lock
+!de4dot
+!androguard_triage.py

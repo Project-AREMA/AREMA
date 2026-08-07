@@ -1,0 +1,25 @@
+# Deny-all egress NetworkPolicy for the analysis-workbench pool.
+#
+# LOAD-BEARING EXFIL PREVENTION (spec 5.1). run_python decrypts live malware, so
+# a compromised pod must have NO network path off the node -- "even a successful
+# injection has no exfil path". This selects every pod labelled
+# arema.dev/pool=analysis-workbench and permits zero egress (DNS included).
+#
+# PREREQUISITE -- a policy-enforcing CNI. This object is INERT under Kind's
+# default CNI (kindnet), which silently ignores NetworkPolicy. The cluster MUST
+# run a policy-enforcing CNI (Calico) or this control does nothing:
+#   1. create the cluster with the default CNI disabled:  make sandbox-cluster
+#   2. install Calico + the framework:                    make setup-sandbox
+#   3. prove enforcement (not just presence):             make sandbox-verify-egress
+# See deploy/sandbox/kind-cluster.yaml and deploy/sandbox/install-agent-sandbox.sh.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: analysis-workbench-denyall-egress
+  namespace: agent-sandbox-demo
+spec:
+  podSelector:
+    matchLabels:
+      arema.dev/pool: analysis-workbench
+  policyTypes: ["Egress"]
+  egress: []
