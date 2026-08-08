@@ -161,3 +161,135 @@ in a live run. A small library of reusable IL-matching helpers there would
 capture much of the same value with no new image, no new binary, and no new
 language — and would show whether the signature-authoring problem is tractable
 before committing to a tool built around it.
+
+---
+
+## TODO-005 — Shodan enrichment of network endpoints
+
+**Status:** researched, not started.
+
+Enrich the endpoints an analysis surfaces — domains, IPs, IP+port pairs — with
+what Shodan already knows about them: open services, banners, ASN, hosting
+country, certificate details. Today an endpoint reaches the report as a bare
+string with no indication of whether it is a bulletproof host, a compromised
+WordPress box, or Cloudflare.
+
+**The credit model decides the design**
+
+| endpoint | returns | query credits |
+|---|---|---|
+| `/shodan/host/{ip}` | every service seen on that IP | **none** |
+| `/dns/resolve` | hostnames → IPs | **none** |
+| `/dns/reverse` | IPs → hostnames | **none** |
+| `/dns/domain/{domain}` | subdomains and DNS records | **1 per lookup** |
+| `/shodan/host/search` | search results | 1 per filtered query |
+
+A free Developer account gets an API key and **zero query credits**, so anything
+credit-consuming fails outright. The zero-credit path is therefore
+**domain → `/dns/resolve` → `/shodan/host/{ip}`**, which answers the question
+that actually matters ("what is running there") without ever touching
+`/dns/domain/`. Build that path; treat the credit-consuming endpoints as a
+separate, later decision.
+
+**The real blocker: there is nothing structured to feed it**
+
+Network IOCs are `EvidenceFinding`s with `kind=network_ioc` whose value lives in
+free-text `claim`/`detail`. There is no structured endpoint field anywhere, and
+`enforce_network_coverage` only *counts* such findings — it never parses one. The
+single piece of structured extraction in the tree is `_URL_RE` in
+`images/deobfuscation-tools/androguard_triage.py`, which is APK-only, URL-only,
+and never leaves that tool's JSON.
+
+Three ways out, cheapest first:
+
+1. **Regex over `detail`** in a post-`network_indicators` callback. The prompt
+   already instructs the model to put the bare value there, and this is the same
+   rung the androguard script already sits on.
+2. **Enrich only the VirusTotal relations**, which are *already* structured
+   (`IntelRelation.value`) and already fetched at intake. Zero extraction work.
+   Narrower coverage: it sees what VT associates, not what the analysis found.
+3. **Widen the evidence schema** with a structured endpoint field. Most correct,
+   most expensive: `EvidenceFinding` is frozen and `extra="forbid"`, with a whole
+   salvage path that exists because models already fumble the current shape.
+
+**What it would take**
+
+`src/reverse_engineering/intel/` is the template — same credential gate, same
+`sanitize_summary` on the way back, same host-side-only rule (sandbox pods have
+`networkPolicy.egress: []`). One caveat: Shodan does **not** belong in
+`IntelSettings.active_sources`, which gates on a *file digest*; it answers about
+endpoints and needs its own switch, or `_lookup_one` will hand it a SHA-256 it
+cannot use.
+
+**Sanitization is mandatory, not optional.** Shodan banners are raw service
+output from hosts an attacker may control, and they land in an ADK instruction
+template where `{}` is a placeholder.
+
+---
+
+## TODO-006 — capa, and a sample knowledge base
+
+**Status:** researched, not started. Two separable pieces; capa can ship alone.
+
+### capa
+
+[capa](https://github.com/mandiant/capa) v9.4.0 identifies capabilities in a
+binary and maps them to **MITRE ATT&CK and MBC**, deterministically, with
+`tactic`/`technique`/`subtechnique`/`id` as structured fields. Today every ATT&CK
+row in a report comes from a model reasoning over prose findings.
+
+- `pip install flare-capa`, Python ≥3.10, ~56 dependencies, no network needed —
+  it fits the egress-denied deobfuscation pod. Standalone binaries also exist.
+- Supports PE, ELF, **.NET**, shellcode, and CAPE/DRAKVUF/VMRay sandbox reports.
+- **Honest limitation:** its .NET extractor is built on `dnfile`/`dncil`, the
+  libraries that struggle on maliciously-crafted assemblies. capa is strongest on
+  native PE/ELF and weakest on exactly the protected .NET samples that are
+  hardest here. Expect little from it on a SmartAssembly-packed sample.
+
+Adding a CLI tool to the deobfuscation image touches six places, all enforced:
+`requirements.in` (+ regenerate the hash-pinned lock), a `Dockerfile` smoke
+assertion, `healthcheck.sh` (it is the pod readiness probe, so a version mismatch
+keeps the pod unready), a wrapper module, `DEOBFUSCATION_TOOLSET` (which also
+puts it inside the sanitization membrane), and the **evidence-critic tool
+allowlist** — a finding citing `capa` is rejected as "cites no known tool" until
+that last one is done.
+
+capa's mappings should enter as `kind="attack"` findings citing `capa`, not
+replace `attack_mapper`. They are different evidence — capabilities from bytes
+versus characterized behaviour — and replacing the mapper would empty the ATT&CK
+section on every Android sample, which capa does not cover at all.
+
+### The knowledge base
+
+The intent is *correlation, not skipping*: right after acquisition, check whether
+this digest has been analyzed before and surface the prior report; use capa
+capability sets as a cross-sample similarity key. **Similar capabilities are a
+lead to follow, never a reason to skip analysis.**
+
+**Blocker, and it is the same one for both pieces: the memory subsystem has
+never persisted a single record.** The live database holds one scope and zero
+rows. `record_tool_event` drops any event without a scope id, and that id is only
+ever seeded by `run_single_query` — which the ADK entry points (`adk run`,
+`adk web`) never call. Fix that one gap and `record_tool_event` and the
+checkpoint recorder start working too.
+
+Once persistence works, the rest is unusually cheap:
+
+- **`MemoryQuery.source` is the digest key.** Indexed, exact-match, queryable
+  across scopes with `scope_id=None`. No schema change, no second migration.
+- **Scopes are durable** — `close_scope` only stamps `closed_at`, and no read
+  path filters on it. A well-known cache scope created idempotently keeps rows
+  reachable after a run scope closes.
+- **Annotations already have a model.** `NoteRecord(text, author)` is registered
+  as the core `arema.core/note` codec and, like everything else here, has never
+  been written.
+- `FINDING_CODEC` is a complete, tested, registered, **entirely unused**
+  template — follow it exactly and you inherit a proven pattern, as its first
+  writer.
+
+Recommended split of annotations: a machine summary written every run (capa
+capabilities, verdict, third-party family names) is what makes correlation work
+at all, and analyst notes added deliberately are knowledge the pipeline cannot
+produce. Keep them in separate report sections for the same reason first-party
+evidence and third-party intel are already kept apart — so "the model thought
+this" never acquires the authority of "the analyst confirmed this".
