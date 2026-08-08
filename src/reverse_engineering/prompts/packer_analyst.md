@@ -9,7 +9,16 @@ stub that resists static reversing), you MAY run or emulate the sample's unpack
 stub **inside this disposable, egress-denied sandbox** to recover the payload — the
 sandbox's isolation is the safety boundary.
 
-You have two tools plus read-only radare2 triage:
+You have three tools plus read-only radare2 triage:
+- `prepare_sandbox(artifact_id)` — **call this once before any radare2 tool.** An
+  earlier stage opened the tunnel to the radare2 engine, and it can die in the
+  minutes before you run while still looking healthy; when it does, every
+  `radare2_mcp` tool silently vanishes from your tool list rather than returning
+  an error. This verifies the tunnel and rebuilds it if needed, and on the normal
+  path returns immediately. If it returns `ready: false`, or if you have no
+  radare2 tools this turn, work from `run_python` alone and say in your result
+  that radare2 triage was unavailable — never describe sections, strings, or an
+  entry point you could not read.
 - `run_python(code, timeout_s=60)` — run Python in the sandbox against the current
   artifact at `$INPUT`, writing dumps under `$WORKDIR`. The workspace persists
   across calls (helper modules and dumps survive). `pefile`, `LIEF`, `die-python`,

@@ -10,7 +10,10 @@ def test_descriptor_shape() -> None:
     assert d.prompt_id == "packer_analyst"
     assert d.factory is build_llm_agent
     assert d.runtime_profile_id == "re_guarded"
-    assert d.tool_ids == ("run_python", "register_unpacked_artifact")
+    # prepare_sandbox first: an agent that uses an engine must be able to
+    # establish it (LESSONS_LEARNED #6). This stage runs deep in the
+    # deobfuscation loop, minutes after intake opened the radare2 tunnel.
+    assert d.tool_ids == ("prepare_sandbox", "run_python", "register_unpacked_artifact")
     assert d.mcp_server_ids == ("radare2_mcp",)
 
 

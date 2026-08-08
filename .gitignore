@@ -51,7 +51,18 @@ coverage.xml
 *.pot
 
 # Environments
+#
+# `env/` below is the virtualenv DIRECTORY pattern and does not match a FILE
+# named `env`. A real one turned up in the working tree holding live provider
+# keys, one `git add -A` away from a public repository. The three patterns here
+# cover the bare file, the dotted forms (`.env.local`) and the suffixed ones
+# (`prod.env`); `.env.example` is negated back in because it is the template and
+# must stay tracked.
 .env
+.env.*
+*.env
+env
+!.env.example
 .venv
 env/
 venv/

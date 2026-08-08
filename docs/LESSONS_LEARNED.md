@@ -166,6 +166,40 @@ between sub-agent delegations. Tools that an agent needs must be on THAT agent's
 each agent's prompt must specify the correct next transfer target, not a
 hypothetical "return to root for the next step."
 
+### Postscript (2026-08-06): the rule was right and applied to half the agents
+
+The same failure returned in a different costume. `Optional MCP server
+unavailable` appeared in 4 of ~60 recorded runs, and the reports it produced
+blamed the analysis engine rather than the transport. Two facts explain it:
+
+1. **A port-forward is opened twice per run, both at intake, and consumed by
+   four agents spread across the pipeline.** `triage_recon` and `packer_analyst`
+   carried no prepare tool at all, so they depended on a tunnel another agent had
+   opened minutes earlier and had no way to repair it. `retriage` and
+   `dotnet_decompile` did carry one. The rule above was followed for half the
+   agents that needed it.
+2. **Repairing would not have worked anyway.** `PortForwardRegistry.open`
+   returned early on `same pod + process alive` without probing, while its own
+   docstring promised to "block until it forwards". `kubectl port-forward`
+   reports per-connection faults and keeps running, so a dead tunnel is
+   indistinguishable from a healthy one by `poll()` alone -- a fact the module
+   documented at `_terminate_handle` and never acted on. Measured: forwards
+   opened at 12:11:25, engines unreachable by 12:14:49, processes still alive,
+   nothing reopening.
+
+**Fix (shipped):** every MCP-consuming agent now carries its engine's prepare
+tool, and `open()` probes an existing tunnel before handing it back, rebuilding
+when the probe fails. A test asserts the property over all four consumers rather
+than the two that were noticed.
+
+**The wider lesson:** "each agent prepares its own engine" is a property of the
+*set* of agents, not advice to apply case by case -- a rule applied to the
+agents someone happened to think of is a rule with holes in it, and the holes
+are invisible until a transport flakes. When a lesson names a class of agent,
+write the test that enumerates the class. Separately: a liveness check that
+tests the *supervisor* (is the process alive?) rather than the *service* (does
+it answer?) will pass through exactly the failure it was written to catch.
+
 ---
 
 ## 7. Ghidra 11.4.x requires JDK 21, not JDK 17

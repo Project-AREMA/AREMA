@@ -32,6 +32,12 @@ TRIAGE_RECON_DESCRIPTOR = AgentDescriptor(
     factory=build_llm_agent,
     runtime_profile_id="re_guarded",
     prompt_loader=load_domain_prompt,
+    # An agent that uses an engine must be able to establish it (LESSONS_LEARNED
+    # #6). The radare2 tunnel is opened once by sample_intake, and kubectl
+    # port-forward drops connections while its process keeps running -- so
+    # without this the stage has no way to repair a tunnel that died between
+    # intake and here, and its whole toolset silently resolves to [].
+    tool_ids=("prepare_sandbox",),
     mcp_server_ids=("radare2_mcp",),
     output_key=TRIAGE_EVIDENCE_KEY,
     after_agent_callbacks=(

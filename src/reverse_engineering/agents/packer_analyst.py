@@ -17,6 +17,10 @@ PACKER_ANALYST_DESCRIPTOR = AgentDescriptor(
     factory=build_llm_agent,
     runtime_profile_id="re_guarded",
     prompt_loader=load_domain_prompt,
-    tool_ids=("run_python", "register_unpacked_artifact"),
+    # prepare_sandbox for the same reason triage_recon carries it: this stage
+    # runs deep in the deobfuscation loop, minutes after intake opened the
+    # radare2 tunnel, and must be able to re-establish it rather than silently
+    # losing its toolset (LESSONS_LEARNED #6).
+    tool_ids=("prepare_sandbox", "run_python", "register_unpacked_artifact"),
     mcp_server_ids=("radare2_mcp",),
 )
