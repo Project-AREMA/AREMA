@@ -78,8 +78,15 @@ def _stderr_tail(handle: _ForwardHandle) -> str:
 def _wait_for_port_ready(
     port: int,
     popen: subprocess.Popen[bytes],
+    *,
+    attempts: int = _FORWARD_READY_RETRIES,
 ) -> bool:
     """Wait until the MCP server at localhost:<port> responds to HTTP requests.
+
+    ``attempts`` separates the two callers. Opening a tunnel means waiting for
+    one to come up, so it keeps the full budget. Checking an existing tunnel is a
+    liveness question with an immediate answer, and retrying it would spend
+    fifteen seconds establishing what the first failure already showed.
 
     A TCP connect only proves the port is open — the MCP StreamableHTTP server
     may accept TCP connections before it is ready to handle the initialize
@@ -94,7 +101,7 @@ def _wait_for_port_ready(
     anything found there later is real.
     """
     url = f"http://127.0.0.1:{port}/mcp"
-    for _ in range(_FORWARD_READY_RETRIES):
+    for _ in range(max(1, attempts)):
         if popen.poll() is not None:
             return False
         try:
@@ -121,12 +128,19 @@ class PortForwardRegistry:
         """Start a port-forward for ``(case_id, port)`` and block until it forwards.
 
         Reconciling, not blindly idempotent: an existing forward for this
-        ``(case, port)`` is reused only when it points at the SAME pod and its
-        process is still alive. A different pod (the caller re-claimed after a
-        failed provision, and the old pod has been terminated) or a dead process
-        replaces the tunnel instead of silently keeping a broken one. A *different*
-        port for the same case opens its own tunnel, so two MCP engines (radare2 on
-        8765, ILSpy on 3001) coexist under one case.
+        ``(case, port)`` is reused only when it points at the SAME pod, its
+        process is still alive, **and it still answers**. A different pod (the
+        caller re-claimed after a failed provision, and the old pod has been
+        terminated), a dead process, or a live process whose tunnel no longer
+        forwards all replace it instead of silently keeping a broken one. A
+        *different* port for the same case opens its own tunnel, so two MCP
+        engines (radare2 on 8765, ILSpy on 3001) coexist under one case.
+
+        The probe is what makes a caller's retry mean anything. Without it this
+        method returned early on ``same pod + process alive``, so a stage calling
+        ``prepare_*`` again to repair a dead tunnel got an immediate ``return``
+        and the same dead tunnel -- while the docstring promised to block until
+        it forwards.
 
         Raises :class:`RuntimeError`, with kubectl's own stderr tail when it wrote
         one, if the tunnel fails to establish.
@@ -134,7 +148,16 @@ class PortForwardRegistry:
         existing = self._forwards.get((case_id, port))
         if existing is not None:
             exit_code = existing.popen.poll()
-            if existing.pod == pod and exit_code is None:
+            same_pod = existing.pod == pod
+            alive = exit_code is None
+            # A live process is not a live tunnel. kubectl reports per-connection
+            # faults on stderr and keeps running, so a dead tunnel looks exactly
+            # like a healthy one from the outside -- which is why this probes
+            # rather than trusting poll(). Measured: forwards opened at 12:11:25
+            # and the engines behind them were unreachable by 12:14:49 with the
+            # processes still running and nothing reopening them.
+            usable = same_pod and alive and _wait_for_port_ready(port, existing.popen, attempts=1)
+            if usable:
                 return
             logger.warning(
                 "replacing a stale port-forward",
@@ -142,7 +165,13 @@ class PortForwardRegistry:
                 port=port,
                 previous_pod=existing.pod,
                 pod=pod,
-                reason="pod replaced" if existing.pod != pod else "process exited",
+                reason=(
+                    "pod replaced"
+                    if not same_pod
+                    else "process exited"
+                    if not alive
+                    else "probe failed"
+                ),
                 exit_code=exit_code,
                 kubectl_stderr=_stderr_tail(existing),
             )

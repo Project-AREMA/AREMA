@@ -15,6 +15,10 @@ from reverse_engineering.runtime import portforward
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
+# The autouse fixture below stubs ``_wait_for_port_ready`` for every test, so the
+# two that exercise the real probe capture it here, before any patching.
+_REAL_WAIT = portforward._wait_for_port_ready
+
 
 class _FakePopen:
     """A minimal stand-in for ``subprocess.Popen`` used by the registry."""
@@ -41,8 +45,10 @@ class _FakePopen:
 @pytest.fixture(autouse=True)
 def _reset_fake_popen(monkeypatch: pytest.MonkeyPatch) -> Any:
     _FakePopen.instances.clear()
-    # The readiness check does a real socket connect; patch it out for tests.
-    monkeypatch.setattr(portforward, "_wait_for_port_ready", lambda _port, _popen: True)
+    # The readiness check does a real HTTP request; patch it out for tests. It
+    # takes a keyword-only ``attempts``, so the stub must accept it -- the reuse
+    # path passes ``attempts=1`` and a two-positional stub would raise there.
+    monkeypatch.setattr(portforward, "_wait_for_port_ready", lambda _port, _popen, **_kwargs: True)
     yield
     _FakePopen.instances.clear()
 
@@ -452,3 +458,231 @@ def test_readiness_probe_closes_an_http_error_response(monkeypatch: pytest.Monke
     monkeypatch.setattr(portforward.urllib.request, "urlopen", _raise_406)
     assert _REAL_WAIT_FOR_PORT_READY(8765, _FakePopen(["kubectl"]))
     assert closed == ["ok"]
+
+
+# --- a live process is not a live tunnel --------------------------------------
+#
+# kubectl port-forward reports per-connection faults on stderr and keeps
+# running, so a dead tunnel is indistinguishable from a healthy one by poll()
+# alone. Measured across recorded runs: forwards opened at 12:11:25 and the
+# engines behind them were unreachable by 12:14:49, processes still alive,
+# nothing reopening. Reuse used to return on `same pod + process alive`, so a
+# stage calling prepare_* again to repair the tunnel got the same dead one.
+
+
+def _probe(monkeypatch: pytest.MonkeyPatch, *results: bool) -> list[dict[str, Any]]:
+    """Install a probe returning ``results`` in order; record every call."""
+    calls: list[dict[str, Any]] = []
+    answers = list(results)
+
+    def _fake(port: int, _popen: Any, *, attempts: int = 15) -> bool:
+        calls.append({"port": port, "attempts": attempts})
+        return answers.pop(0) if answers else True
+
+    monkeypatch.setattr(portforward, "_wait_for_port_ready", _fake)
+    return calls
+
+
+def test_a_reused_forward_is_probed_before_it_is_trusted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(portforward.subprocess, "Popen", _FakePopen)
+    calls = _probe(monkeypatch, True, True)
+    registry = portforward.PortForwardRegistry()
+
+    registry.open(case_id="c", namespace="ns", pod="pod-a", port=8765)
+    registry.open(case_id="c", namespace="ns", pod="pod-a", port=8765)
+
+    # one probe when opening, one when reusing
+    assert len(calls) == 2
+    assert len(_FakePopen.instances) == 1  # healthy tunnel is kept
+
+
+def test_the_reuse_probe_makes_one_attempt_not_fifteen(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Opening waits for a tunnel to come up and keeps the full budget. Checking
+    an existing one is a liveness question with an immediate answer -- retrying
+    would spend fifteen seconds establishing what the first failure showed."""
+    monkeypatch.setattr(portforward.subprocess, "Popen", _FakePopen)
+    calls = _probe(monkeypatch, True, True)
+    registry = portforward.PortForwardRegistry()
+
+    registry.open(case_id="c", namespace="ns", pod="pod-a", port=8765)
+    registry.open(case_id="c", namespace="ns", pod="pod-a", port=8765)
+
+    assert calls[0]["attempts"] == portforward._FORWARD_READY_RETRIES
+    assert calls[1]["attempts"] == 1
+
+
+def test_a_dead_tunnel_on_a_live_process_is_rebuilt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The bug itself. The process is alive and the pod matches, so the old code
+    returned early and handed back a tunnel that no longer forwards."""
+    monkeypatch.setattr(portforward.subprocess, "Popen", _FakePopen)
+    _probe(monkeypatch, True, False, True)  # open ok, reuse probe fails, rebuild ok
+    registry = portforward.PortForwardRegistry()
+
+    registry.open(case_id="c", namespace="ns", pod="pod-a", port=8765)
+    first = _FakePopen.instances[0]
+    registry.open(case_id="c", namespace="ns", pod="pod-a", port=8765)
+
+    assert first.terminated, "the dead tunnel must be torn down"
+    assert len(_FakePopen.instances) == 2, "a fresh tunnel must replace it"
+
+
+def test_a_rebuild_after_a_failed_probe_gets_the_full_retry_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reuse probe is fast because it is a question; the rebuild that follows
+    is an open and must wait for the tunnel like any other."""
+    monkeypatch.setattr(portforward.subprocess, "Popen", _FakePopen)
+    calls = _probe(monkeypatch, True, False, True)
+    registry = portforward.PortForwardRegistry()
+
+    registry.open(case_id="c", namespace="ns", pod="pod-a", port=8765)
+    registry.open(case_id="c", namespace="ns", pod="pod-a", port=8765)
+
+    assert [c["attempts"] for c in calls] == [
+        portforward._FORWARD_READY_RETRIES,
+        1,
+        portforward._FORWARD_READY_RETRIES,
+    ]
+
+
+def test_a_failed_probe_is_reported_as_its_own_reason(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Distinguishable in the log from a replaced pod or an exited process --
+    a probe failure means the fix fired, and reads as success, not regression."""
+    monkeypatch.setattr(portforward.subprocess, "Popen", _FakePopen)
+    _probe(monkeypatch, True, False, True)
+    registry = portforward.PortForwardRegistry()
+
+    registry.open(case_id="c", namespace="ns", pod="pod-a", port=8765)
+    capsys.readouterr()
+    registry.open(case_id="c", namespace="ns", pod="pod-a", port=8765)
+
+    assert "probe failed" in capsys.readouterr().out
+
+
+def test_a_replaced_pod_still_reports_pod_replaced(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The pre-existing reasons must not be swallowed by the new one: a
+    different pod is diagnosed as such without ever probing the old tunnel."""
+    monkeypatch.setattr(portforward.subprocess, "Popen", _FakePopen)
+    calls = _probe(monkeypatch, True, True)
+    registry = portforward.PortForwardRegistry()
+
+    registry.open(case_id="c", namespace="ns", pod="pod-a", port=8765)
+    capsys.readouterr()
+    registry.open(case_id="c", namespace="ns", pod="pod-b", port=8765)
+
+    assert "pod replaced" in capsys.readouterr().out
+    assert len(calls) == 2, "a different pod needs no probe of the old tunnel"
+
+
+def test_an_exited_process_still_reports_process_exited(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(portforward.subprocess, "Popen", _FakePopen)
+    _probe(monkeypatch, True, True)
+    registry = portforward.PortForwardRegistry()
+
+    registry.open(case_id="c", namespace="ns", pod="pod-a", port=8765)
+    _FakePopen.instances[0].terminated = True  # process died on its own
+    capsys.readouterr()
+    registry.open(case_id="c", namespace="ns", pod="pod-a", port=8765)
+
+    assert "process exited" in capsys.readouterr().out
+
+
+def test_a_second_engine_on_another_port_is_untouched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """radare2 on 8765 and ILSpy on 3001 coexist under one case; probing one
+    must not disturb the other."""
+    monkeypatch.setattr(portforward.subprocess, "Popen", _FakePopen)
+    _probe(monkeypatch, True, True, True)
+    registry = portforward.PortForwardRegistry()
+
+    registry.open(case_id="c", namespace="ns", pod="pod-a", port=8765)
+    registry.open(case_id="c", namespace="ns", pod="pod-b", port=3001)
+    registry.open(case_id="c", namespace="ns", pod="pod-a", port=8765)
+
+    assert len(_FakePopen.instances) == 2
+    assert not any(p.terminated for p in _FakePopen.instances)
+
+
+def test_the_probe_stops_at_the_first_answer(monkeypatch: pytest.MonkeyPatch) -> None:
+    """attempts bounds retries, not requests: one success returns immediately."""
+    seen = {"n": 0}
+
+    class _Resp:
+        def __enter__(self) -> Any:
+            return self
+
+        def __exit__(self, *_a: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return b""
+
+    def _urlopen(_url: str, timeout: float = 2) -> Any:  # noqa: ARG001
+        seen["n"] += 1
+        return _Resp()
+
+    monkeypatch.setattr(portforward.urllib.request, "urlopen", _urlopen)
+
+    assert _REAL_WAIT(8765, _FakePopen(["x"]), attempts=15)
+    assert seen["n"] == 1
+
+
+def test_a_probe_of_a_dead_port_is_bounded_by_attempts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reuse path must cost one failed request, not fifteen seconds of them."""
+    seen = {"n": 0}
+
+    def _refuse(_url: str, timeout: float = 2) -> Any:  # noqa: ARG001
+        seen["n"] += 1
+        raise ConnectionRefusedError
+
+    monkeypatch.setattr(portforward.urllib.request, "urlopen", _refuse)
+    monkeypatch.setattr(portforward.time, "sleep", lambda _s: None)
+
+    assert not _REAL_WAIT(8765, _FakePopen(["x"]), attempts=1)
+    assert seen["n"] == 1
+
+
+# --- every MCP consumer can establish its own engine --------------------------
+
+
+def test_every_mcp_consuming_agent_can_prepare_its_engine() -> None:
+    """LESSONS_LEARNED #6, applied consistently rather than to half the agents.
+
+    The tunnel is opened twice per run, both at intake, while four agents consume
+    those two servers minutes apart. Two of them carried no prepare tool, so they
+    depended on a tunnel another agent opened and had no way to repair it -- and
+    when it died their whole toolset silently resolved to an empty list.
+    """
+    from reverse_engineering.agents.dotnet_decompile import DOTNET_DECOMPILE_DESCRIPTOR
+    from reverse_engineering.agents.packer_analyst import PACKER_ANALYST_DESCRIPTOR
+    from reverse_engineering.agents.retriage import RETRIAGE_DESCRIPTOR
+    from reverse_engineering.agents.triage_recon import TRIAGE_RECON_DESCRIPTOR
+
+    prepare_for = {"radare2_mcp": "prepare_sandbox", "ilspy_mcp": "prepare_ilspy"}
+    consumers = (
+        TRIAGE_RECON_DESCRIPTOR,
+        RETRIAGE_DESCRIPTOR,
+        PACKER_ANALYST_DESCRIPTOR,
+        DOTNET_DECOMPILE_DESCRIPTOR,
+    )
+    for descriptor in consumers:
+        for mcp_id in descriptor.mcp_server_ids:
+            needed = prepare_for[mcp_id]
+            assert needed in descriptor.tool_ids, (
+                f"{descriptor.id} consumes {mcp_id} but cannot call {needed}"
+            )
