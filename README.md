@@ -9,11 +9,9 @@ decompiles, and reports on a sample, with **every finding cited to the tool that
 produced it**.
 
 <p align="center">
-  <img src="docs/image/pipeline-overview.png" width="100%"
-       alt="The autonomous analysis pipeline: the greeter_agent router hands off to the malware_analyst SequentialAgent, which runs nine fixed-order stages (sample_intake, triage_recon, a deobfuscation LoopAgent, a format-routed deep-engine with Ghidra for native, ILSpy for .NET, jadx for JVM, then parallel IOC extraction, behavior, ATT&CK mapping, an evidence critic, and the report) over engines confined to isolated, deny-all-egress Kubernetes pods.">
+  <img src="docs/image/AREMA-logo.jpg" width="66%"
+       alt="AREMA — Autonomous Reverse Engineering & Malware Analysis">
 </p>
-
-<p align="center"><sub><b>The autonomous pipeline.</b> One model-directed hop (the greeter router) hands off to a deterministic <code>SequentialAgent</code> of nine fixed-order stages; every engine that touches sample bytes runs off-host in an isolated, deny-all-egress Kubernetes pod.</sub></p>
 
 ---
 
@@ -91,6 +89,13 @@ inventing what static analysis can't reach.
 <p align="center"><sub><b>.NET, ConfuserEx-protected.</b> The agentic <code>dotnet_analyst</code> statically unpacks the SkiDzEX/ConfuserEx protection, then decompilation surfaces process-hollowing, self-deletion, and anti-analysis behavior, each mapped to ATT&CK, with de4dot/FLOSS limitations recorded honestly.</sub></p>
 
 ## Architecture
+
+<p align="center">
+  <img src="docs/image/pipeline-overview.png" width="100%"
+       alt="The autonomous analysis pipeline: the greeter_agent router hands off to the malware_analyst SequentialAgent, which runs nine fixed-order stages (sample_intake, triage_recon, a deobfuscation LoopAgent, a format-routed deep-engine with Ghidra for native, ILSpy for .NET, jadx for JVM, then parallel IOC extraction, behavior, ATT&CK mapping, an evidence critic, and the report) over engines confined to isolated, deny-all-egress Kubernetes pods.">
+</p>
+
+<p align="center"><sub><b>The autonomous pipeline.</b> One model-directed hop (the greeter router) hands off to a deterministic <code>SequentialAgent</code> of nine fixed-order stages; every engine that touches sample bytes runs off-host in an isolated, deny-all-egress Kubernetes pod.</sub></p>
 
 Three layers, dependencies pointing strictly downward:
 

@@ -35,7 +35,7 @@ git clone https://github.com/<your-org>/AREMA.git
 cd AREMA
 
 # 3. Install Python + dev dependencies
-make setup                   # uv sync --extra dev
+make setup                   # uv sync --extra dev --inexact (--inexact preserves the sandbox extra)
 
 # 4. Create a Kind cluster with the default CNI disabled, so the deny-all egress
 #    NetworkPolicy on the analysis-workbench pool is actually enforced (Calico is
@@ -45,7 +45,7 @@ make sandbox-cluster         # kind create cluster --config deploy/sandbox/kind-
 
 # 5. Install the policy-enforcing CNI (Calico) + the sandbox client deps + the
 #    Agent Sandbox framework (controller + router). One-time per cluster.
-make setup-sandbox           # uv sync --extra sandbox + deploy/sandbox/install-agent-sandbox.sh
+make setup-sandbox           # uv sync --extra dev --extra sandbox + deploy/sandbox/install-agent-sandbox.sh
 
 # 6. Configure the LLM provider + sandbox
 cp .env.example .env

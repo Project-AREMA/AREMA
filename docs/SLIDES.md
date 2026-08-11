@@ -163,9 +163,10 @@ Minimal, elegant, high-contrast. No text.
 **② Talk track**
 > The core (`src/arema`) knows nothing about malware — no tool names, no domains.
 > It's a shell for *building* defended agent pipelines. Capabilities live in
-> domain packages that plug in. The reverse-engineering domain is the first real
-> tenant. The neutral core is enforced by tests: a *comment* mentioning "ghidra"
-> in the core fails the build.
+> domain packages that plug in. The `malware_analyst` domain — built on a shared
+> `reverse_engineering` capability library — is the first real tenant. The neutral
+> core is enforced by tests: a *comment* mentioning "ghidra" in the core fails
+> the build.
 
 **③ Image prompt**
 ```
@@ -246,7 +247,7 @@ never touching the top. Dark navy background, volumetric, clean. No text.
 
 **① On-slide** *(native flow diagram)*
 ```
-sample_intake → triage_recon → deobfuscation(loop) → deep_engine_router
+sample_intake → triage_router → deobfuscation(loop) → deep_engine_router
     → ioc → behavior → attack_mapper → evidence_critic → report
 ```
 - One ADK **`SequentialAgent`** — fixed order, each stage runs to completion before the next.

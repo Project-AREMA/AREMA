@@ -23,7 +23,8 @@ does not work is the natural next request:
 The resolution half works. The comparison half does not, and the pipeline is
 structurally single-artifact rather than incidentally so:
 
-- **43 call sites** hang off one `CURRENT_ARTIFACT_KEY`
+- **over twenty call sites across ~20 modules** hang off one
+  `CURRENT_ARTIFACT_KEY`
   (`src/reverse_engineering/tools/deobfuscation/state.py:17`).
 - `reset_deobfuscation_state` states the rule outright: *"The new canonical
   artifact id is the only authority retained."* A second ingest deliberately

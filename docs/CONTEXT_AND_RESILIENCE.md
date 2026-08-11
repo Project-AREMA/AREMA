@@ -2,9 +2,12 @@
 
 AREMA keeps long autonomous runs inside a provider's context window and keeps
 transient infrastructure failures from aborting a run. Four domain-neutral
-mechanisms cooperate (none of them knows the name or shape of any concrete tool)
-plus one domain-level mechanism that keeps a stage's evidence from being lost
-at the model boundary.
+mechanisms cooperate (none of them knows the name or shape of any concrete tool):
+per-tool output compaction, context-budget enforcement, resilient MCP
+degradation, and fail-open memory. A fifth neutral layer (`runtime/callbacks/
+sanitization/`) structurally neutralizes prompt-injection text in
+untrusted-origin tool output, and one domain-level mechanism keeps a stage's
+evidence from being lost at the model boundary.
 
 ## Two layers of context management
 
@@ -46,7 +49,7 @@ configured budget into a `ContextPressure` tier.
 | `NORMAL`   | below `CONTEXT_WARNING_RATIO` (0.60) | nothing done; request proceeds |
 | `WARNING`  | ≥ `CONTEXT_WARNING_RATIO`    | compact old tool results using the configured recent-preservation counts |
 | `HARD`     | ≥ `CONTEXT_HARD_RATIO` (0.75) | halve both preservation counts (floored at 1) |
-| `CRITICAL` | ≥ `CONTEXT_CRITICAL_RATIO` (0.85) | preserve only the single most recent tool result and model turn; halve the text-truncation floor |
+| `CRITICAL` | ≥ `CONTEXT_CRITICAL_RATIO` (0.85) | preserve only the single most recent tool result and model turn; halve both text-truncation floors (`text_min_length` 500→250 floored at 200, `text_prefix_chars` 200→100 floored at 100) |
 
 The settings validator enforces `warning < hard < critical`.
 
@@ -64,8 +67,9 @@ Within a pressure tier the pass runs in two stages:
 
 If, after the most aggressive compaction, occupancy is still `CRITICAL`, the run
 has no safe way to continue. Rather than submit an oversized request, the
-callback records a bounded checkpoint in session state and returns an explanatory
-`LlmResponse` that stops the run cleanly.
+callback records a bounded checkpoint under session-state key
+`context_budget:checkpoint` (`{tokens, budget, ratio}`) and returns an
+explanatory `LlmResponse` that stops the run cleanly.
 
 All thresholds and preservation counts are `Settings` fields
 (`CONTEXT_BUDGET_TOKENS`, the three ratios, `CONTEXT_PRESERVE_RECENT_TOOLS`,
@@ -93,6 +97,15 @@ later environment mutation cannot retroactively change resolved values. Resolved
 secrets are confined to the ADK connection parameters and never placed in logs or
 exception text by this layer.
 
+Each resolved tool is wrapped in a `_SerializedTool` that holds one `asyncio.Lock`
+per toolset. ADK dispatches every function call in a single model turn
+concurrently (`asyncio.gather`), but an MCP server that fronts one stateful
+backend (one subprocess, one session cursor) cannot serve concurrent in-flight
+requests over its one session — a call that sets server-side state can interleave
+with a later call that depends on it. The per-toolset lock makes the calls run one
+at a time against that session, exactly as if the model had issued them
+sequentially, without changing the tool's name or declaration.
+
 > MCP toolsets **are** wired onto agents: the agent factory resolves an agent's
 > `mcp_server_ids` into `ResilientMcpToolset`s (via `build_mcp_toolset`) and
 > appends them to the agent's `tools`. MCP tools flow through the same callback
@@ -117,11 +130,17 @@ Every lifecycle write degrades open:
   CLI `/status` command can observe the condition without reaching into backend
   internals.
 
+The neutral core registers four codec payloads at schema version 1 under
+namespace `arema.core` (`default_core_codec_registry`): `event`, `checkpoint`,
+`note`, and `artifact`. Only these typed, neutral records ever cross the store
+boundary.
+
 Retrieval is equally conservative: `retrieve_bounded` admits records in the
-store's deterministic order until either the record cap or the estimated-token
-cap would be exceeded, and flags `truncated` when anything was left out. Nothing
-retrieved is ever injected into an agent instruction implicitly; a caller always
-decides what to do with it.
+store's deterministic order until either the record cap (`memory_retrieval_max_records`,
+default 20) or the estimated-token cap (`memory_retrieval_token_limit`, default
+4_000) would be exceeded, and flags `truncated` when anything was left out.
+Nothing retrieved is ever injected into an agent instruction implicitly; a caller
+always decides what to do with it.
 
 ## Fail-open evidence (`reverse_engineering/evidence_envelope.py`)
 
@@ -167,11 +186,13 @@ runs **before** memory-recording and the output compactor (which stays last).
 
 - **`OutputSanitizer`**: a `Protocol` (`sanitize(tool_name, response) -> dict`).
   The default backend is `StructuralSanitizer` (data-frame wrapping + a curated
-  case-insensitive prompt-injection regex denylist). A future `GuardrailsSanitizer`
-  implements the same protocol so Guardrails AI drops in without a rewrite.
-- **`make_sanitizing_after_tool(sanitizer, untrusted_tools)`**: builds the
+  case-insensitive prompt-injection regex denylist); `PassthroughSanitizer` is
+  the no-op backend used in tests and as the "disabled" sentinel. A future
+  `GuardrailsSanitizer` would implement the same protocol so Guardrails AI drops
+  in without a rewrite.
+- **`make_sanitizing_after_tool(sanitizer, binary_origin_tools)`**: builds the
   `after_tool` callback. It sanitizes only tools whose names are in the
-  `untrusted_tools` set (e.g. the r2mcp, ghidra, and jadx/androguard tool
+  `binary_origin_tools` set (e.g. the r2mcp, ghidra, and jadx/androguard tool
   names); all others pass through untouched. Fail-open: a sanitizer exception is
   swallowed and the original response passes through.
 - **Lossless for genuine tool output**: real decompiled code contains no
@@ -182,13 +203,47 @@ its set of untrusted-origin tool names:
 
 ```python
 RE_GUARDED = replace(RuntimeProfile.safe_default(), id="re_guarded",
-    extra_after_tool=(make_sanitizing_after_tool(StructuralSanitizer(), untrusted_tools),))
+    extra_after_tool=(make_sanitizing_after_tool(StructuralSanitizer(), binary_origin_tools),))
 ```
 
 ## Where the pieces attach
 
 The runtime profile decides which of these run for a given agent. In the guarded
-`safe_default` profile they are all enabled, and the callback chain guarantees
-the ordering that makes them correct. Most importantly, **output compaction is
-always the last after-tool step**, so metrics and memory observe full output
-before it is bounded for context.
+`safe_default` profile they are all enabled, and `build_callback_chain`
+(`runtime/callbacks/chain.py`) assembles them in one approved order, then
+re-validates the result.
+
+### Ordering invariants (`validate_callback_chain`)
+
+Two invariants are enforced, and crucially they are checked with **identity role
+markers** (`runtime/callbacks/roles.py`), never `__name__` comparisons — so
+wrapping, decorating, or renaming a callback cannot silently defeat them:
+
+1. The registered-tool guard (`ROLE_REGISTERED_TOOL_GUARD`), when present, is
+   **first** in `before_tool`, so an unknown tool is rejected before any other
+   callback invests work in it.
+2. Output compaction (`ROLE_COMPACT_TOOL_OUTPUT`), when present, is the **single
+   last** step in `after_tool`, so metrics, memory, and sanitization all observe
+   the untruncated response before it is bounded for context.
+
+### Why the after-tool list is folded into one callback (`compose_after_tool`)
+
+ADK walks its after-tool list and **stops at the first callback returning a
+truthy value** (`flows/llm_flows/functions.py`: `if altered_function_response:
+break`). That short-circuit is fatal to the "compactor last" invariant: a
+callback that *transforms* the response — the sanitization membrane, for one —
+returns a value by construction, so every later step was being skipped,
+including compaction. The effect was exactly inverted: compaction died for
+precisely the binary-origin tools it exists to bound.
+
+`compose_after_tool` restores the documented semantics by folding the entire
+validated after-tool list into **one** callback. That callback runs every step in
+order, threads each step's result into the next, and returns `None` only when no
+step altered the response. The chain itself stays an ordered, validated tuple
+(ordered by `build_callback_chain`, re-checked by `validate_callback_chain`), so
+the role markers and the "compactor last" invariant keep holding on the real
+list — ADK simply never gets the chance to short-circuit between steps.
+
+This is why **output compaction is always the last after-tool step in practice**:
+metrics, memory, and sanitization observe full output before it is bounded for
+context, and no transforming callback can accidentally skip the compactor.

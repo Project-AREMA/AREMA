@@ -17,7 +17,7 @@ enforcement against the known incident evidence with no Kubernetes and no model.
 
 ## AI-001 — Sandbox identity depends on the entry point
 
-**Status:** Implemented (56553e8, 0007309, 69fbf77)
+**Status:** Implemented (56553e8, 0007309, 69fbf77) — Resolved: `src/arema/runtime/sessions.py::resolve_sandbox_case_id` + `SessionKeys.SANDBOX_CASE_ID` provide the domain-neutral resolver; the `re-mvp` fallback is gone from production paths.
 
 **Observed in:** ADK Dev UI session
 `9f3a73cf-38a5-43f9-b2af-ee8430cdca7d`
@@ -61,7 +61,7 @@ Remove the `re-mvp` fallback from production tool paths.
 
 ## AI-002 — Recovery failures disappear at the loop boundary
 
-**Status:** Implemented (238b194)
+**Status:** Implemented (238b194) — Resolved: `src/reverse_engineering/agents/deobf_gate.py` writes a terminal `RECOVERY_SUMMARY_KEY` (canonical artifact id, UPX/FLOSS outcomes, error codes, exit reason, limitations) that downstream stages consume and that survives loop exit.
 
 ### Failure
 
@@ -105,7 +105,7 @@ supported failure/limitation records, and the report renders them.
 
 ## AI-003 — Deep analysis completion is model-discretionary
 
-**Status:** Implemented (1c88786, 696213c)
+**Status:** Implemented (1c88786, 696213c) — Resolved: `src/reverse_engineering/agents/deep_analysis.py` (LoopAgent) plus `deep_analysis_gate.py::evaluate_deep_analysis_gate` require successful Ghidra prep, a cross-function semantic search, and a targeted decompile/p-code result before exit; metadata-only output forces another bounded iteration.
 
 ### Failure
 
@@ -151,7 +151,7 @@ Metadata, imports, or a function-name page cannot satisfy the gate.
 
 ## AI-004 — IOC extraction runs before the strongest evidence exists
 
-**Status:** Implemented (51a4e85)
+**Status:** Implemented (51a4e85) — Resolved: spine reordered in `src/malware_analyst/composition.py` so `ioc_extraction` runs after `deep_engine_router`/`deep_analysis`; IOC lenses receive triage, recovery/FLOSS, and deep-analysis state.
 
 ### Failure
 
@@ -196,7 +196,7 @@ identity.
 
 ## AI-005 — Evidence handoff relies on ambient conversation history
 
-**Status:** Implemented (ec18958)
+**Status:** Implemented (ec18958) — Resolved: `src/reverse_engineering/evidence_envelope.py` (`EvidenceEnvelope`, `EvidenceFinding`) carry named, bounded JSON state contracts per evidence-producing stage; prompts reference injected aliases, not ambient history.
 
 ### Failure
 
@@ -241,7 +241,7 @@ silently disappearing.
 
 ## AI-006 — Evidence critic scope does not match the pipeline
 
-**Status:** Implemented (5c0b616)
+**Status:** Implemented (5c0b616) — Resolved: `src/reverse_engineering/agents/evidence_critic.py` consumes every upstream evidence envelope (triage, recovery, deep analysis, host/network IOC, behavior, ATT&CK), validates tool citation and artifact identity, rejects with a bounded reason, and carries upstream limitations into the validated envelope.
 
 ### Failure
 
@@ -283,7 +283,7 @@ The report generator consumes only this validated envelope.
 
 ## AI-007 — Agent contracts permit false negative conclusions
 
-**Status:** Implemented (51a4e85, 5c0b616, 696213c)
+**Status:** Implemented (51a4e85, 5c0b616, 696213c) — Resolved: `EvidenceCoverage` / `CoverageStatus` in `src/reverse_engineering/evidence_envelope.py` gate negative conclusions on completed coverage; incomplete coverage yields "not determined" with the blocking limitation.
 
 ### Failure
 

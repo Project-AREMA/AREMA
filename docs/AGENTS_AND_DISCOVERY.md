@@ -12,9 +12,12 @@ domain; each domain is a self-contained agent graph.
 
 ```
 greeter_agent  (welcome router, the only top-level entry users see)
-   └─ sub_agents = [ reverse_engineer, <future domains…> ]
+   └─ sub_agents = [ malware_analyst, <future domains…> ]
                     └─ each domain is itself a root + its own sub-agents
-                        e.g. reverse_engineer (a SequentialAgent shell): sample_intake → triage_recon → deep_decompile → evidence_critic → report_generator
+                        e.g. malware_analyst (a SequentialAgent shell):
+                             sample_intake → triage_router → deobfuscation → deep_engine_router
+                             → ioc_extraction → behavior_characterization → attack_mapper
+                             → evidence_critic → malware_report_generator → token_usage_reporter
 ```
 
 ## 1. ADK discovery: `src/` is the agents directory
@@ -26,23 +29,28 @@ module-level `root_agent` is one discoverable agent.**
 
 ```
 src/
-  arema/              # neutral core LIBRARY, no agent.py → NOT an adk entry
-  greeter_agent/      # agent.py → discoverable as "greeter_agent"  (the router)
-  reverse_engineer/   # agent.py → discoverable as "reverse_engineer"
-  <new_domain>/       # agent.py → discoverable as "<new_domain>"
+  arema/                # neutral core LIBRARY, no agent.py → NOT an adk entry
+  greeter_agent/        # agent.py → discoverable as "greeter_agent"  (the router)
+  malware_analyst/      # agent.py → discoverable as "malware_analyst"  (a domain)
+  reverse_engineering/  # capability LIBRARY, no agent.py → NOT discoverable
+  <new_domain>/         # agent.py → discoverable as "<new_domain>"
 ```
 
 ### The folder-IS-package rule (no shadowing)
 
 Because `src/` is put on `sys.path`, a package folder and the importable module
-share the same name. This is **correct and intended**: `src/reverse_engineer/`
-*is* the `reverse_engineer` package, so `from reverse_engineer.composition …`
-inside `src/reverse_engineer/agent.py` resolves to itself, with no shadowing.
+share the same name. This is **correct and intended**: `src/malware_analyst/`
+*is* the `malware_analyst` package, so `from malware_analyst.composition …`
+inside `src/malware_analyst/agent.py` resolves to itself, with no shadowing.
+(`src/reverse_engineering/` is likewise the `reverse_engineering` package, but
+it has no `agent.py`, so it is an importable capability library, not a
+discoverable agent — `malware_analyst` imports it to reuse shared RE tools,
+MCP servers, profiles, codecs, and agent descriptors.)
 
 > **Never** introduce a *separate* discovery folder (e.g. a top-level `agents/`
 > dir) whose name matches an installed package. ADK inserts the discovery dir at
-> `sys.path[0]`, so `agents/reverse_engineer/` would shadow
-> `src/reverse_engineer/` and `agents/arema/` would shadow `src/arema/`, breaking
+> `sys.path[0]`, so `agents/malware_analyst/` would shadow
+> `src/malware_analyst/` and `agents/arema/` would shadow `src/arema/`, breaking
 > imports. (This was the root cause of the earlier `adk run`/`adk web` failures.
 > The fix was to delete `agents/` entirely and discover from `src/`.)
 
@@ -60,37 +68,50 @@ __all__ = ["root_agent"]
 ADK looks for `root_agent` at module scope. Building the composition at import
 is expected (it is `@lru_cache`d and cheap until a run actually calls the model).
 
-## 2. The three package kinds
+## 2. The four package kinds
 
 | Package | Example | Has `agent.py`? | Role |
 |---|---|---|---|
 | **Neutral core** | `src/arema/` | **No** | Domain-neutral shell: config, registry, runtime, memory, sandbox, runner. Never names a domain. |
-| **Welcome router** | `src/greeter_agent/` | Yes | The single top-level entry. Owns no tools; holds domain roots as ADK sub-agents and routes via ADK's auto `transfer_to_agent`. |
-| **Domain** | `src/reverse_engineer/` | Yes | One specialist capability. A full composition (catalog + memory + tools/MCP + its own sub-agents). |
+| **Welcome router** | `src/greeter_agent/` | Yes | The single top-level entry. Owns no tools; holds domain roots as ADK sub-agents and routes via ADK's auto `transfer_to_subagent`. |
+| **Domain** | `src/malware_analyst/` | Yes | One specialist capability. A full composition (catalog + memory + its own sub-agents) plus its own agents/prompts. |
+| **Capability library** | `src/reverse_engineering/` | **No** | Shared infrastructure imported by domains: runtime profiles, function tools, MCP servers, codecs, and reusable agent descriptors. Not discoverable; has no root. |
 
 Dependency direction is strictly downward: **router/domain → arema**, never the
 reverse. Domains never import each other (the router composes them; a domain
-that needs another's output gets it via routing, not imports).
+that needs another's output gets it via routing, not imports). A domain *may*
+import a capability library: `malware_analyst` imports `reverse_engineering`
+(via `register_re_infrastructure`) to reuse shared profiles, tools, MCP servers,
+codecs, and agents.
 
 ## 3. Domain package anatomy
 
 A domain mirrors the neutral core's composition shape but lives outside the
 neutrality perimeter (so it may name its tools, such as `radare2` or `ghidra`).
+`malware_analyst` is the live domain; its shared RE infrastructure lives in the
+`reverse_engineering` capability library, which it pulls in via
+`register_re_infrastructure(builder, codecs, settings)`.
 
 ```
-src/reverse_engineer/
+src/malware_analyst/
   __init__.py
-  agent.py              # root_agent = get_reverse_engineer_composition().root_agent
-  composition.py        # build_<domain>_composition() + @lru_cache get_<domain>_composition()
-  prompts/              # <domain>-relative prompt loader + *.md instruction files
-    loader.py           # load_<domain>_prompt(id) via importlib.resources
+  agent.py              # root_agent = get_malware_analyst_composition().root_agent
+  composition.py        # build_malware_analyst_composition() + @lru_cache get_malware_analyst_composition()
+  evidence.py           # domain evidence envelope (reuses reverse_engineering's types)
+  prompts/              # load_malware_prompt(id) via importlib.resources + *.md files
+    loader.py
     *.md
   agents/               # AgentDescriptors + factories for the domain's sub-agents
-  tools/                # function tools + ToolDescriptors
-  mcp/                  # McpServerDescriptors
-  artifacts/ evidence/  # domain stores / codecs as needed
-  runtime/              # domain runtime helpers (e.g. port-forward registry)
 ```
+
+The shared infrastructure imported from `reverse_engineering` (and registered
+into the domain's catalog) comprises: 4 runtime profiles (`safe_default`,
+`re_guarded`, `re_deep_agentic`, `evidence_isolated`), the ingest/deobfuscation/
+workbench/android/Ghidra/Jadx function tools, the `radare2_mcp` and `ilspy_mcp`
+MCP servers, the `FINDING_CODEC`, and ~31 reusable agent descriptors. The
+`malware_analyst` domain itself registers no tools, MCP servers, codecs, or
+runtime profiles — only its root + 7 malware-specific agents (it cherry-picks
+the shared RE agents it needs and freezes on root id `"malware_analyst"`).
 
 Key points (see also `docs/EXTENDING_AREMA.md` for descriptor details):
 - **Prompts are package-relative.** The neutral core's `load_prompt` only reads
@@ -101,7 +122,8 @@ Key points (see also `docs/EXTENDING_AREMA.md` for descriptor details):
 - **Settings resolve via `get_settings()`** (reads `.env`/env), exactly like the
   core's `get_default_composition`. Tests stay hermetic by pinning a
   credential-free provider in the domain's `tests/<domain>/conftest.py`
-  (mirror `tests/component/conftest.py`).
+  (mirror `tests/malware_analyst/conftest.py`, which itself mirrors
+  `tests/reverse_engineering/conftest.py`).
 - **The descriptor `id` must equal the tool function's `__name__`** so its
   `OutputPolicy` binds at compaction time.
 - **Function tools needing `RuntimeServices`** (e.g. the sandbox executor) use a
@@ -114,15 +136,15 @@ Key points (see also `docs/EXTENDING_AREMA.md` for descriptor details):
 A domain root may be a **composite shell** (an ADK `SequentialAgent`,
 `ParallelAgent`, or `LoopAgent`) by setting `prompt_id=None` and
 `factory=build_sequential_agent` / `build_parallel_agent` / `build_loop_agent`
-(from `arema.runtime.agent_factory`). Such a descriptor declares only
-`sub_agent_ids` (no `tool_ids`, `mcp_server_ids`, or `output_key`); the catalog
-enforces this at freeze time. The framework runs the children in declared order
-(sequence) / concurrently (parallel) / looped (loop, which requires
-`metadata["max_iterations"]` as a positive int). The `reverse_engineer` domain
-uses a `SequentialAgent` root so the pipeline cannot loop on complex binaries
-(LESSONS_LEARNED #1). `build_parallel_agent` / `build_loop_agent` ship as the
-ready foundation and are wired by later slices (r2 ∥ Ghidra consensus; the
-deobfuscation loop).
+(from `arema.runtime.agent_factory`). All three factories ship today. Such a
+descriptor declares only `sub_agent_ids` (no `tool_ids`, `mcp_server_ids`, or
+`output_key`); the catalog enforces this at freeze time. The framework runs the
+children in declared order (sequence) / concurrently (parallel) / looped (loop,
+which requires `metadata["max_iterations"]` as a positive int). The
+`malware_analyst` domain uses a `SequentialAgent` root so the pipeline cannot
+loop on complex binaries (LESSONS_LEARNED #1); it embeds a `ParallelAgent`
+(ioc_extraction → host/network indicators) and a `LoopAgent` (the bounded
+deobfuscation loop, `max_iterations=6`) as interior stages.
 
 ## 4. The welcome router (`greeter_agent`)
 
@@ -135,18 +157,19 @@ def build_greeter_agent(settings=None) -> LlmAgent:
         name="greeter_agent",
         model=get_agent_model("greeter_agent", settings=resolved, use_retries=True),
         instruction=load_greeter_prompt("greeter"),
-        sub_agents=list(_domain_roots()),   # [reverse_engineer root, …]
+        sub_agents=list(_domain_roots()),   # [malware_analyst root, …]
     )
 ```
 
 - It has **no AREMA function tools** and therefore no registered-tool guard,
   output compactor, or per-tool memory callbacks (those belong on the domain
-  agents that actually call tools). ADK auto-generates a `transfer_to_agent`
+  agents that actually call tools). ADK auto-generates a `transfer_to_subagent`
   tool per registered domain root; the model routes by calling it. AREMA's
   `registered_tool_guard` only blocks ADK's `_unknown_tool_*` stubs, so
   legitimate transfer tools pass through.
-- **`_domain_roots()`** is the single registration point. Adding a domain =
-  appending one line (see §6).
+- **`_domain_roots()`** (the single registration point) currently returns only
+  `get_malware_analyst_composition().root_agent`. Adding a domain = appending
+  one line (see §6).
 - Each domain root is a fully-built composition (its own catalog/memory/callbacks).
   The greeter just holds the references; ADK's delegation moves control between
   them. The greeter does **not** merge domains into one catalog.
@@ -160,7 +183,8 @@ def build_greeter_agent(settings=None) -> LlmAgent:
 3. **`src/arema` is domain-neutral.** Architecture tests
    (`tests/architecture/test_neutral_boundaries.py`) scan it for domain terms
    (`radare2`, `ghidra`, …) and fail the build if any appear. Domain code lives
-   in `src/<domain>/`.
+   in `src/<domain>/`. (The `Sandbox` subsystem lives in `arema` but stays
+   neutral: it depends only on `arema.core/` and names no specific engine.)
 4. **Direction:** router/domain → arema, downward only; domains never import each
    other.
 5. **One welcome router.** Users reach domains *through* the greeter. Domains are
@@ -178,11 +202,14 @@ def build_greeter_agent(settings=None) -> LlmAgent:
 ## 6. Recipe: add a new domain (e.g. `vulnerability_researcher`)
 
 1. **Scaffold the package** under `src/vulnerability_researcher/` (copy the
-   `reverse_engineer` anatomy): `__init__.py`, `agent.py`, `composition.py`,
-   `prompts/` (loader + `.md`), and whatever `agents/`/`tools/`/`mcp/` it needs.
+   `malware_analyst` anatomy): `__init__.py`, `agent.py`, `composition.py`,
+   `prompts/` (loader + `.md`), and an `agents/` for its sub-agents. If it
+   shares infrastructure with another domain, import that capability library
+   (the way `malware_analyst` imports `reverse_engineering`).
 2. **`composition.py`**: write `build_vulnerability_researcher_composition()` +
-   `@lru_cache get_vulnerability_researcher_composition()`, registering its
-   profile/agents/tools/MCP/codec and freezing on its root. Use
+   `@lru_cache get_vulnerability_researcher_composition()`, registering any
+   profile/agents/tools/MCP/codec it owns (or reusing a capability library's
+   `register_*` helper) and freezing on its root. Use
    `get_settings()`; provide a `load_<domain>_prompt` via each descriptor's
    `prompt_loader`.
 3. **`agent.py`**: `root_agent = get_vulnerability_researcher_composition().root_agent`.
@@ -192,7 +219,8 @@ def build_greeter_agent(settings=None) -> LlmAgent:
    append `get_vulnerability_researcher_composition().root_agent`.
 6. **Tests**: `tests/vulnerability_researcher/` with a `conftest.py` pinning
    `AREMA_LLM_PROVIDER=ollama` (+ cache clears) like
-   `tests/reverse_engineer/conftest.py`.
+   `tests/malware_analyst/conftest.py` (which mirrors
+   `tests/reverse_engineering/conftest.py`).
 7. **Verify**: `make check` green; `adk run src/vulnerability_researcher` loads;
    the greeter routes to it (`adk run src/greeter_agent`).
 
@@ -203,7 +231,7 @@ That is the entire surface area. No core changes are required to add a domain.
 - **Web UI:** `make adk-web` → lists `greeter_agent` and every domain. Pick one
   and chat. (Runs `adk web` with `cwd=src/`.)
 - **Interactive CLI:** `make adk-run` → `adk run src/greeter_agent` (the router).
-  For a domain directly: `adk run src/reverse_engineer`.
+  For a domain directly: `adk run src/malware_analyst`.
 - **Sandbox (RE flow):** disabled by default. Enable per-run with
   `AREMA_SANDBOX_ENABLED=true` (and `--extra sandbox` for the k8s client). The
   pool map in `.env` must list all six engine pools:

@@ -4,6 +4,23 @@
 
 ---
 
+> **Implementation status (as of HEAD).** The malware-analysis MVP described
+> below is now implemented. The live domain is `src/malware_analyst/` — a
+> 10-stage `SequentialAgent` root (`sample_intake → triage_router →
+> deobfuscation → deep_engine_router → ioc_extraction →
+> behavior_characterization → attack_mapper → evidence_critic →
+> malware_report_generator → token_usage_reporter`). It is built on the shared
+> reverse-engineering capability library `src/reverse_engineering/` (no root
+> agent of its own) and the domain-neutral core `src/arema/`. radare2, Ghidra,
+> ILSpy, and jadx engines are all wired; the sanitization membrane,
+> deobfuscation loop, evidence envelope, and evidence critic all ship; MCP is
+> attached to agents end to end. This document remains the design rationale and
+> forward-looking vision; inline notes mark where a described capability has
+> since been realized. The vulnerability-research "second mindset" (§0, §6) and
+> the dynamic-analysis / corpus-correlation phases remain future work.
+
+---
+
 # 0\. Scope & assumptions (read this first)
 
 This revision realigns the design to the current project decisions. Where a decision was underspecified, the assumption made is stated here so it can be vetoed:
@@ -49,7 +66,7 @@ Described as a plain workflow (per the project's "workflow → agentic task" phi
 
 **Phase 1 — Recon / triage (radare2-first, parallel fan-out).** On the raw bytes, concurrently: file/format/arch identification, entropy \+ packer detection (Detect-It-Easy), string extraction (raw \+ FLOSS), capa capabilities, YARA *scan* against existing rulesets, and **radare2 `aaa`** to produce the function inventory \+ call graph \+ imports/exports. Triage also **routes by format** (native → r2 \+ Ghidra; .NET → ILSpy) and runs a cheap **corpus lookup** (fuzzy/import hashes vs. prior cases) to answer "have we seen this — or something like it?" before any deep work. Output: a **triage bundle** (a durable artifact, Cerberus-style) that schedules everything downstream. *(PMA Ch. 1–3.)*
 
-**Phase 2 — Deobfuscation loop** *(conditional; `LoopAgent`, max 3 iterations).* If triage flags packing/obfuscation: classify (CFF, bogus control flow, string encryption, API hashing, VM), apply the matching recovery (FLOSS, unpacking profile, p-code emulation, memory carve), re-triage, and **require evidence that quality improved** or exit to manual. Capped to prevent the "never-ending automation" failure mode from the challenges paper. *(PRE Ch. 5; PMA Ch. 15–18.)*
+**Phase 2 — Deobfuscation loop** *(conditional; `LoopAgent`, max 3 iterations).* If triage flags packing/obfuscation: classify (CFF, bogus control flow, string encryption, API hashing, VM), apply the matching recovery (FLOSS, unpacking profile, p-code emulation, memory carve), re-triage, and **require evidence that quality improved** or exit to manual. Capped to prevent the "never-ending automation" failure mode from the challenges paper. *(PRE Ch. 5; PMA Ch. 15–18.)* *(Now implemented as the `deobfuscation_loop` agent — a `LoopAgent` capped at **6** iterations, with UPX/FLOSS/de4dot/dnlib recovery tools and a `recovery_skip` bypass; see `src/reverse_engineering/`.)*
 
 **Phase 3 — Deep decompilation (format-routed).** *Native* (PE/ELF/Mach-O): import into Ghidra (ghidralib/PyGhidra), produce per-function decompilation from each, and **reconcile** — agree → high confidence; disagree → flag for closer analysis. *Managed code* skips the native consensus: **.NET/CIL → ILSpy** (`ilspycmd`/MCP), both of which decompile near-source, so a single authoritative decompiler suffices (an optional second — e.g. dnSpyEx or CFR — can still cross-check).
 
@@ -120,6 +137,16 @@ MVP agents in **bold**; the rest are the RE-general core filled in over the road
 
 The **mindset** column is how one core serves two goals: the malware and vuln mindsets are the *same pipeline* with different lens agents (Behavior vs VulnLens) and different report templates — not two codebases.
 
+> *(Implementation note.)* In the shipped malware-analysis MVP the "AnalystConsole
+> root" is realized as the `malware_analyst` `SequentialAgent` shell, and the
+> boldface MVP agents above are all live: `SanitizationMembrane` (the
+> `StructuralSanitizer` wired as an after-tool callback in the `re_guarded`
+> profile), `TriageRecon` (+ an `android_triage` variant), the deobfuscation
+> loop, format-routed deep decompile (`deep_engine_router` → `deep_analysis` /
+> `dotnet_deep_analysis` / `java_deep_analysis`), `EvidenceCritic`, and
+> `ReportGenerator` (`malware_report_generator`). `FunctionSemantics`,
+> `VulnLens`, `DynamicAnalysis`, and `CorpusCorrelation` remain future work.
+
 ---
 
 ## 7\. Tooling & engines
@@ -134,6 +161,14 @@ The **mindset** column is how one core serves two goals: the malware and vuln mi
 
 **Engine ordering (as specified):** r2 recon **first** (cheap, schedules the rest) → Ghidra \+ IDA **deep in parallel** → reconcile. IDA is optional because idalib needs an OEM license for server/multi-user use; the free default path (Ghidra) is fully functional, and IDA joins the consensus when a license is present. **Format routes before engines:** triage first decides native vs. managed; native follows r2 → Ghidra ∥ IDA, while .NET goes to ILSpy and Java/Android to jadx — managed bytecode decompiles near-source, so the heavy consensus step is native-only.
 
+> *(Now implemented.)* r2 is exposed via the **`radare2_mcp`** server (StreamableHttp over `kubectl port-forward`, 31 read-only r2 tools allowlisted, 300 s cap); Ghidra via the **`ghidra-rpc`** pool (metadata / list_functions / decompile / search_decompiled / xrefs_to / imports / strings / pcode tools); .NET via **`ilspy_mcp`** (23 ILSpy tools) plus `dnlib` round-tripping on the `analysis-workbench` pool; Java/Android via the **`jadx`** pool (manifest / classes / class_source / search_sources / strings / resources). IDA, z3, and p-code emulation remain future work. See `src/reverse_engineering/register_re_infrastructure` and `docs/AGENTS_AND_DISCOVERY.md`.
+
 ---
 
 Very important, for the radare2 tool we have a previous attempt, use /Users/alevsk/Development/security-agent-adk/mcp-servers/r2-mcp for inspiration and evaluate if this is the right way to have the r2 tool for usage to the agent
+
+> *(Resolved.)* The r2 tool is now provided by the **`radare2_mcp`** server (see
+> the §7 note above and `src/reverse_engineering/`), registered via
+> `register_re_infrastructure` as an optional `StreamableHttp` MCP server with a
+> 31-tool read-only allowlist. The earlier `r2-mcp` prototype served as the
+> inspiration referenced here.

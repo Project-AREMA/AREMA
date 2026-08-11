@@ -20,17 +20,23 @@ sub-agent transfer to any sibling — the model doesn't always follow the intend
 linear sequence. On long, complex analyses the model loses track of pipeline
 state and re-delegates to agents that already ran, creating loops.
 
-**Fix (shipped, B.5):** The `reverse_engineer` root is now an ADK
-`SequentialAgent` shell built by `build_sequential_agent` in the neutral core.
-Its five stages — `sample_intake` → `triage_recon` → `deep_decompile` →
-`evidence_critic` → `report_generator` — run in a fixed, framework-enforced
-order, each to completion before the next. Ingest (`acquire_sample` +
-`prepare_sandbox`) moved to the new `sample_intake` first stage. The analysis
-prompts no longer direct transfers. Zero `transfer_to_agent` calls occur inside
-the pipeline; the only LLM-directed hop is `greeter → reverse_engineer` (one
-robust top-level routing decision). `build_parallel_agent` / `build_loop_agent`
-ship alongside as the ready foundation for NORTH_STAR Axis-2 consensus and the
-deobfuscation loop.
+**Fix (shipped, B.5):** The pipeline root is an ADK `SequentialAgent` shell
+built by `build_sequential_agent` in the neutral core. (It shipped as the
+`reverse_engineer` root; that domain has since been split into the reusable
+`reverse_engineering` capability library and the `malware_analyst` domain, and
+the `SequentialAgent` shell now lives on the `malware_analyst` root.) What began
+as five stages — `sample_intake` → `triage_recon` → `deep_decompile` →
+`evidence_critic` → `report_generator` — has since grown into a fixed,
+framework-enforced ordered graph of ten children: `sample_intake` →
+`triage_router` → `deobfuscation` → `deep_engine_router` → `ioc_extraction` →
+`behavior_characterization` → `attack_mapper` → `evidence_critic` →
+`malware_report_generator` → `token_usage_reporter`, each to completion before
+the next. Ingest (`acquire_sample` + `prepare_sandbox`) moved to the new
+`sample_intake` first stage. The analysis prompts no longer direct transfers.
+Zero `transfer_to_agent` calls occur inside the pipeline; the only LLM-directed
+hop is `greeter → malware_analyst` (one robust top-level routing decision).
+`build_parallel_agent` / `build_loop_agent` ship alongside as the ready
+foundation for NORTH_STAR Axis-2 consensus and the deobfuscation loop.
 
 **Lesson:** Never rely on the LLM to direct agent execution order on complex tasks.
 Use framework-enforced orchestration (SequentialAgent, ParallelAgent) for any
@@ -146,7 +152,8 @@ differs from the documentation.
 ## 6. Each analysis agent must prepare its own engine
 
 **Symptom:** `prepare_ghidra` was registered on the root agent
-(`reverse_engineer`). The root's workflow said "call prepare_ghidra between
+(`reverse_engineer` — the pre-split domain, now the `reverse_engineering`
+library + `malware_analyst` domain). The root's workflow said "call prepare_ghidra between
 triage and deep_decompile." But `prepare_ghidra` was never called — the Ghidra
 tools reported "not prepared for this case."
 
@@ -297,16 +304,19 @@ prevents the neutral core from accidentally coupling to a specific domain.
 ## 11. The `make check` lint scope must cover all source packages
 
 **Symptom:** Unused `# noqa` directives and formatting issues in
-`src/reverse_engineer/` were never caught by `make check`. The Makefile's lint
+`src/reverse_engineer/` (the pre-split domain, now `src/reverse_engineering/` +
+`src/malware_analyst/`) were never caught by `make check`. The Makefile's lint
 target only covered `src/arema`.
 
 **Root cause:** `SRC := src/arema` in the Makefile. As new domain packages were
-added (`src/greeter_agent`, `src/reverse_engineer`), they weren't included in
+added (`src/greeter_agent`, `src/reverse_engineer` — the latter since split into
+`src/reverse_engineering/` + `src/malware_analyst/`), they weren't included in
 the lint/typecheck scope. Issues slipped through silently.
 
 **Fix:** Extended `SRC` to `src/arema src/greeter_agent src/reverse_engineer`.
 Future domains are covered if they're added to the list (or if `SRC` is changed
-to `src`).
+to `src`). The scope has since grown to all four src packages
+(`src/arema src/greeter_agent src/reverse_engineering src/malware_analyst`).
 
 **Lesson:** When the project structure grows (new packages, new domains), update
 the quality-gate scope. A lint/typecheck target that doesn't cover all source

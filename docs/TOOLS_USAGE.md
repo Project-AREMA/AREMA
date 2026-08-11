@@ -17,7 +17,7 @@ in the matrix", not "invent a new path".
 | **ilspy-mcp** | MCP service (ICSharpCode.Decompiler), port-forward | `prepare_ilspy` + `mcp_server_ids=("ilspy_mcp",)` | **Managed deep decompilation**: .NET/CIL metadata → C#. |
 | **jadx** | Exec-driven sandbox CLI toolset (`kubectl exec`), like ghidra; **no network service** | `prepare_jadx` + the jadx toolset | **Android/JVM deep decompilation**: DEX/APK bytecode → Java. |
 | **deobfuscation-tools** | Exec-driven sandbox (`kubectl exec`, `stage_artifact`/`run_argv`); **no network service** | the deterministic recovery tools (`upx_unpack`, `floss_decode`, `de4dot_deobfuscate`) + `android_triage_scan` (androguard) | **Deterministic recovery**: fixed CLI tools that undo a *known* packing/obfuscation in one shot (UPX, FLOSS, de4dot). Cheap, no reasoning. Also hosts **androguard** (`/opt/androguard_triage.py`) for **Android triage**. |
-| **analysis-workbench** | Exec-driven Python-scripting sandbox (`run_python`), persistent per-case workspace | the `packer_analyst` / `dotnet_analyst` agents (`run_python` + `register_unpacked_artifact` + radare2_mcp triage) | **Agentic recovery**: an open Python + r2pipe + crypto/parse-lib workbench where an LLM *reasons* about an *unknown/custom* packer and reimplements the unpacking. Expensive, bounded by a budget. |
+| **analysis-workbench** | Exec-driven Python-scripting sandbox (`run_python`), persistent per-case workspace | the `packer_analyst` / `dotnet_analyst` agents (`run_python` + `register_unpacked_artifact`; `packer_analyst` also attaches `radare2_mcp` for triage), plus the deterministic `dnlib_roundtrip` tool | **Agentic recovery** (and one deterministic .NET step): an open Python + radare2/r2pipe + dnlib + crypto/parse-lib workbench where an LLM *reasons* about an *unknown/custom* packer and reimplements the unpacking. Also hosts the no-model `dnlib_roundtrip` metadata repair for .NET. Expensive, bounded by a budget. |
 
 These six engines serve three functional roles, and each role is realized
 once per sample technology.
@@ -25,7 +25,7 @@ once per sample technology.
 | Role | What it answers | Native engine | Managed (.NET) engine | Android (DEX/APK) engine |
 |---|---|---|---|---|
 | **Triage** | "What is this and how is it protected?" | radare2-mcp | radare2-mcp (PE wrapper only; CIL is skipped) | **android_triage**: androguard in the deobfuscation-tools pod (radare2 sees only the ZIP shell; Dalvik is skipped) |
-| **Recovery: deterministic** | "Undo a *known* protection in one shot" | deobfuscation-tools: `upx`, `floss` | deobfuscation-tools: `de4dot` | **(none; jadx opens APK/DEX/JAR directly. A DEX packer is *detected* at triage, not stripped)** |
+| **Recovery: deterministic** | "Undo a *known* protection in one shot" | deobfuscation-tools: `upx`, `floss` | deobfuscation-tools: `de4dot`; analysis-workbench: `dnlib_roundtrip` (metadata repair when de4dot fails/crashes) | **(none; jadx opens APK/DEX/JAR directly. A DEX packer is *detected* at triage, not stripped)** |
 | **Recovery: agentic** | "Reason about an *unknown/custom* protection and script the unpack" | analysis-workbench: `packer_analyst` | analysis-workbench: `dotnet_analyst` (dnlib/.NET) | **(gap)** |
 | **Deep decompile** | "Reconstruct source-level code for analysis" | ghidra-rpc | ilspy-mcp | **jadx** (DEX/APK → Java) + **android_native_analysis** (Ghidra over the bundled `.so`) |
 
@@ -37,18 +37,18 @@ sample_intake → triage_router → deobfuscation(loop) → deep_engine_router �
 
 | Stage | Engine used | Role |
 |---|---|---|
-| `sample_intake` | none (acquire_sample hashes+stores, **detects the container format** → `SAMPLE_FORMAT_KEY` and **names the packer/protector** from its watermark → `SAMPLE_PACKER_KEY`; `prepare_sandbox`/`prepare_ilspy` warm the pods, and prepare_sandbox also runs the **Detect It Easy pre-validator** on the staged bytes → `SAMPLE_DIE_KEY`) | classify technology |
+| `sample_intake` | none (acquire_sample hashes+stores, **detects the container format** → `SAMPLE_FORMAT_KEY` and **names the packer/protector** from its watermark → `SAMPLE_PACKER_KEY`; `prepare_sandbox`/`prepare_ilspy` warm the pods, and prepare_sandbox also runs the **Detect It Easy pre-validator** on the staged bytes → `SAMPLE_DIE_KEY`); `acquire_sample` also performs **hash-reputation** lookup (CIRCL hashlookup keyless, MalwareBazaar, VirusTotal — only the SHA-256 ever leaves the host; no source uploads, and no credential means no request) when a credential is configured | classify technology |
 | `triage_router` (format router) | routes by `SAMPLE_FORMAT_KEY` | n/a |
 | ↳ `apk`/`dex`/`jar` → `android_triage` | **deobfuscation-tools** (androguard) | triage |
 | ↳ default → `triage_recon` | **radare2-mcp** | triage (native/.NET) |
 | `deobfuscation` (LoopAgent): `deobf_classify → recover → scripted_recover → dotnet_scripted_recover → retriage → deobf_gate` | see below | recovery |
-| ↳ `recover` (Sequential): `upx_unpack → floss_decode → dotnet_recover` (a **managed-only format gate** over `de4dot_deobfuscate → dnlib_roundtrip`) | **deobfuscation-tools** | deterministic recovery; upx/floss are PE-universal, the .NET tools run only for a `dotnet` assembly (a native sample skips them with no model turn) |
+| ↳ `recover` (Sequential): `upx_unpack → floss_decode → dotnet_recover` (a **managed-only format gate** over `de4dot_deobfuscate → dnlib_roundtrip`) | **deobfuscation-tools** (upx, floss, de4dot); **analysis-workbench** (`dnlib_roundtrip`, which needs the workbench pod's dnlib + dotnet-script) | deterministic recovery; upx/floss are PE-universal, the .NET tools run only for a `dotnet` assembly (a native sample skips them with no model turn) |
 | ↳ `scripted_recover` (gate) → `packer_analyst` | **analysis-workbench** (+ radare2-mcp triage) | agentic recovery (native `packed-other` only) |
 | ↳ `dotnet_scripted_recover` (gate) → `dotnet_analyst` | **analysis-workbench** (dnlib/.NET) | agentic recovery (managed `.NET`, e.g. de4dot-crashing ConfuserEx) |
 | ↳ `retriage` | **radare2-mcp** | re-triage the recovered artifact |
 | `deep_engine_router` (format router) | routes by `SAMPLE_FORMAT_KEY` | n/a |
 | ↳ native → `deep_analysis` (Ghidra loop) | **ghidra-rpc** | deep decompile |
-| ↳ dotnet → `dotnet_decompile` | **ilspy-mcp** | deep decompile |
+| ↳ dotnet → `dotnet_deep_analysis` (`dotnet_decompile`/ILSpy, then `dotnet_native_pivot` → `dotnet_native_analysis`/Ghidra when the managed leg produced no findings) | **ilspy-mcp** + **ghidra-rpc** (conditional native fallback) | deep decompile |
 | ↳ `apk`/`dex`/`jar` → `java_deep_analysis` | **jadx** + **ghidra-rpc** (over the extracted native `.so`) | deep decompile |
 | `ioc` / `behavior` / `attack_mapper` / `evidence_critic` / `report` | none (evidence consumers; read session state only) | synthesis |
 
@@ -91,7 +91,7 @@ A **native binary** (PE/ELF/Mach-O). Flow:
 2. `triage_recon` → **radare2-mcp** (sections, imports, strings, entropy → is it packed? how?).
 3. `deobfuscation`:
    - `recover` → **deobfuscation-tools**: `upx_unpack` (UPX), `floss_decode` (encoded strings). Each no-ops if not applicable.
-   - if `obf_class == packed-other` (custom packer UPX/FLOSS can't touch) → `scripted_recover` → `packer_analyst` uses **analysis-workbench** (`run_python` + r2pipe + pefile/LIEF/pycryptodome/aplib) to reverse the stub and reimplement the unpack.
+   - if `obf_class == packed-other` (custom packer UPX/FLOSS can't touch) → `scripted_recover` → `packer_analyst` uses **analysis-workbench** (`run_python` + radare2/r2pipe + pefile/LIEF/pycryptodome) to reverse the stub and reimplement the unpack.
 4. `deep_engine_router` → native → `deep_analysis` → **ghidra-rpc** decompiles to pseudo-C.
 5. Evidence stages synthesize IOCs/behavior/ATT&CK → report.
 
@@ -104,12 +104,17 @@ A **.NET/CIL assembly** (`dotnet`). Flow:
    (radare2 reads the PE wrapper, meaning sections and the CLI header, but not the
    managed metadata/method bodies usefully; see `prompts/triage_recon.md`).
 3. `deobfuscation`:
-   - `recover` → **deobfuscation-tools**: `de4dot_deobfuscate` self-gates on
-     `SAMPLE_FORMAT_KEY == "dotnet"` and deobfuscates a *de4dot-supported*
-     obfuscator (SmartAssembly, older ConfuserEx, …).
-   - `scripted_recover` skips `dotnet` (it's the *native* agentic path), which is
-     the gap for .NET protections de4dot can't handle.
-4. `deep_engine_router` → dotnet → `dotnet_decompile` → **ilspy-mcp** decompiles to C#.
+   - `recover` → `dotnet_recover` (managed-only gate): `de4dot_deobfuscate`
+     (**deobfuscation-tools**) self-gates on `SAMPLE_FORMAT_KEY == "dotnet"` and
+     deobfuscates a *de4dot-supported* obfuscator (SmartAssembly, older ConfuserEx, …),
+     then `dnlib_roundtrip` (**analysis-workbench**) repairs the metadata when de4dot
+     fails or crashes so the assembly loads again.
+   - `dotnet_scripted_recover` → `dotnet_analyst` (**analysis-workbench**, dnlib/.NET)
+     is the managed twin of `packer_analyst`: it runs when de4dot did *not* fully
+     recover, to reverse the protector and extract config (see §6).
+4. `deep_engine_router` → dotnet → `dotnet_deep_analysis`: `dotnet_decompile` drives
+   **ilspy-mcp** (CIL → C#), then `dotnet_native_pivot` runs `dotnet_native_analysis`
+   (**ghidra-rpc**) over the PE only if the managed leg produced no findings.
 5. Evidence stages → report.
 
 ## 5b. `Android` (APK/DEX/JAR) samples: the newest column
@@ -122,9 +127,10 @@ An **Android / JVM-bytecode** sample (`apk`, `dex`, or `jar`). Flow:
    pod): package identity, permissions, exported components, signing cert, DEX
    metadata, and a commercial-packer name match. radare2 is skipped: it would see
    only the ZIP shell, just as CIL is skipped for `.NET`.
-3. `deobfuscation`: the shared loop runs but has no Android recovery engine: jadx
-   opens the container directly, so there is no unpack step. A detected DEX packer is
-   reported as a limitation/host-IOC, not stripped. (Both recovery cells are empty.)
+3. `deobfuscation`: the format router sends JVM formats to `recovery_skip` — the
+   native/.NET `deobfuscation_loop` is bypassed entirely (jadx opens the container
+   directly, so there is no unpack step). A detected DEX packer is reported as a
+   limitation/host-IOC, not stripped. (Both recovery cells are empty.)
 4. `deep_engine_router` → `apk`/`dex`/`jar` → **`java_deep_analysis`**: `java_decompile`
    drives **jadx** (DEX/APK → Java, the deep-evidence slot), then `android_native_analysis`
    extracts one ABI's native `.so` and runs **ghidra-rpc** over it (the native-evidence
