@@ -800,6 +800,21 @@ diagnosis, because "ILSpy was never attached", "ILSpy was defeated" and "ILSpy
 was killed before it started" are indistinguishable downstream and all want the
 same answer: read the bytes. It fails toward pivoting.
 
+**Follow-up (shipped): the governor now bounds tokens, not just executions.**
+The validation run made the case better than the incident did. On the *same*
+sample, with nothing failing and no cap reached, the workbench went from 49
+executions costing 5.19M tokens to **91 costing 11.6M** — the run total doubling
+from 7.7M to 18.3M. Peak context reached 228k, above the *old* 200k ceiling, so
+the raise had gone from precaution to load-bearing in one run.
+
+So `run_python_budget_guard` gained a second axis: a token ceiling measured from
+the workbench's *own* first script, so a sample with an expensive triage does not
+arrive with its allowance already spent. It is a backstop rather than a routine
+limit — set above both observed healthy runs so it never truncates work that was
+going to succeed, and below a further doubling so a genuine runaway stops. Both
+measured runs are pinned as tests, because a ceiling that cuts short a good run
+is a worse failure than the one it was written to prevent.
+
 **Lesson:** A resource governor must bound the resource that is actually scarce.
 Counting invocations is a proxy for cost, and a proxy that is wrong by two orders
 of magnitude is not a bound at all — it is a number that makes everyone feel

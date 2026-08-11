@@ -18,6 +18,24 @@ WORKBENCH_EXEC_COUNT_KEY = "workbench:exec_count"
 # bounding a runaway.
 WORKBENCH_MAX_EXECUTIONS = 100
 
+# Tokens spent since the workbench's first script, and the ceiling on them.
+#
+# The execution cap above bounds how MANY scripts run and says nothing about what
+# they cost, which is a proxy that was wrong by two orders of magnitude. Measured
+# on one sample across two runs: 49 executions cost 5.19M tokens, then 91 cost
+# 11.6M -- the second run hit no cap, broke nothing, and still doubled. What ends
+# a run is not the count; it is that every later stage inherits the conversation
+# these scripts grew, so an unbounded workbench starves the stages behind it (see
+# LESSONS_LEARNED #20, where the ILSpy stage was killed before its first call).
+#
+# The ceiling is a backstop, not a routine limit: it sits above both observed
+# healthy runs so it never truncates work that was going to succeed, and below
+# the next doubling so a genuine runaway stops. A baseline is snapshotted at the
+# first script so this measures the workbench's OWN spend, not a run that merely
+# had an expensive triage.
+WORKBENCH_TOKEN_BASELINE_KEY = "workbench:token_baseline"
+WORKBENCH_MAX_TOKENS = 16_000_000
+
 # The workbench tool ids, kept beside the other workbench constants as the single
 # source of truth: the SanitizationMembrane's binary-origin set (``profiles.py``)
 # and the per-tool budget guard (``budget.py``) both import them rather than

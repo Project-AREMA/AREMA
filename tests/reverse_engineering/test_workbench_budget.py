@@ -12,10 +12,13 @@ workbench tools are inside the SanitizationMembrane's binary-origin set.
 
 from __future__ import annotations
 
+from arema.runtime.sessions import SessionKeys
 from reverse_engineering.tools.workbench.budget import run_python_budget_guard
 from reverse_engineering.tools.workbench.state import (
     WORKBENCH_EXEC_COUNT_KEY,
     WORKBENCH_MAX_EXECUTIONS,
+    WORKBENCH_MAX_TOKENS,
+    WORKBENCH_TOKEN_BASELINE_KEY,
 )
 
 
@@ -134,3 +137,117 @@ def test_workbench_tools_are_sanitized() -> None:
     from reverse_engineering.profiles import _BINARY_ORIGIN_TOOLS
 
     assert {"run_python", "register_unpacked_artifact"} <= _BINARY_ORIGIN_TOOLS
+
+
+# --- the token axis -----------------------------------------------------------
+#
+# The execution cap counts scripts and says nothing about what they cost, which
+# is a proxy that was wrong by two orders of magnitude. Measured on one sample
+# across two runs: 49 executions cost 5.19M tokens, then 91 cost 11.6M. Neither
+# hit the 100-execution cap. What ends a run is the conversation those scripts
+# grow, which every later stage inherits -- LESSONS_LEARNED #20.
+
+
+def _usage(total: int) -> dict[str, object]:
+    """A MODEL_USAGE accumulator carrying `total` tokens, in the real shape."""
+    return {
+        "run_id": "r1",
+        "by_model": {"m": {"input": total, "cached": 0, "output": 0, "thinking": 0}},
+    }
+
+
+def _ctx(state: _State) -> object:
+    return type("C", (), {"state": state})()
+
+
+_TOOL = type("T", (), {"name": "run_python"})()
+
+
+def test_the_first_script_snapshots_a_baseline_rather_than_charging_the_run() -> None:
+    """An expensive triage must not arrive at the workbench having already spent
+    its allowance -- the ceiling measures this stage's own work."""
+    state = _State({SessionKeys.MODEL_USAGE: _usage(3_000_000)})
+
+    assert run_python_budget_guard(_TOOL, {}, _ctx(state)) is None
+    assert state[WORKBENCH_TOKEN_BASELINE_KEY] == 3_000_000
+
+
+def test_spend_below_the_ceiling_proceeds() -> None:
+    state = _State({SessionKeys.MODEL_USAGE: _usage(1_000_000)})
+    run_python_budget_guard(_TOOL, {}, _ctx(state))  # baseline at 1M
+
+    state[SessionKeys.MODEL_USAGE] = _usage(1_000_000 + WORKBENCH_MAX_TOKENS - 1)
+
+    assert run_python_budget_guard(_TOOL, {}, _ctx(state)) is None
+
+
+def test_spend_at_the_ceiling_short_circuits() -> None:
+    state = _State({SessionKeys.MODEL_USAGE: _usage(1_000_000)})
+    run_python_budget_guard(_TOOL, {}, _ctx(state))
+
+    state[SessionKeys.MODEL_USAGE] = _usage(1_000_000 + WORKBENCH_MAX_TOKENS)
+    blocked = run_python_budget_guard(_TOOL, {}, _ctx(state))
+
+    assert blocked is not None
+    assert "tokens" in str(blocked["stderr"])
+    assert "finalize" in str(blocked["stderr"])
+
+
+def test_the_token_block_matches_run_python_result_shape() -> None:
+    """A before_tool return value IS the tool response, so a wrong shape would
+    reach the model as a malformed result rather than an advisory."""
+    state = _State({SessionKeys.MODEL_USAGE: _usage(0)})
+    run_python_budget_guard(_TOOL, {}, _ctx(state))
+    state[SessionKeys.MODEL_USAGE] = _usage(WORKBENCH_MAX_TOKENS)
+    blocked = run_python_budget_guard(_TOOL, {}, _ctx(state))
+
+    assert set(blocked) == {"exit_code", "stdout", "stderr", "truncated", "spilled_artifact_id"}
+    assert blocked["exit_code"] == 1
+
+
+def test_both_observed_healthy_runs_stay_under_the_ceiling() -> None:
+    """The ceiling is a backstop, not a routine limit. Truncating work that was
+    going to succeed would be a worse failure than the one being fixed."""
+    for measured in (5_190_000, 11_642_265):
+        state = _State({SessionKeys.MODEL_USAGE: _usage(0)})
+        run_python_budget_guard(_TOOL, {}, _ctx(state))
+        state[SessionKeys.MODEL_USAGE] = _usage(measured)
+
+        assert run_python_budget_guard(_TOOL, {}, _ctx(state)) is None, measured
+
+
+def test_a_runaway_beyond_the_next_doubling_is_stopped() -> None:
+    """11.6M doubling again is the case this exists for."""
+    state = _State({SessionKeys.MODEL_USAGE: _usage(0)})
+    run_python_budget_guard(_TOOL, {}, _ctx(state))
+    state[SessionKeys.MODEL_USAGE] = _usage(11_642_265 * 2)
+
+    assert run_python_budget_guard(_TOOL, {}, _ctx(state)) is not None
+
+
+def test_unreadable_usage_lets_work_through_rather_than_blocking_it() -> None:
+    """A governor that cannot read usage must fail open. Blocking on missing
+    telemetry would turn an observability gap into a stalled analysis."""
+    for acc in (None, "junk", {}, {"by_model": "junk"}, {"by_model": {"m": "junk"}}):
+        state = _State({SessionKeys.MODEL_USAGE: acc})
+        assert run_python_budget_guard(_TOOL, {}, _ctx(state)) is None
+
+
+def test_the_execution_cap_still_applies_independently() -> None:
+    """Two axes, either of which can stop the stage."""
+    state = _State(
+        {SessionKeys.MODEL_USAGE: _usage(0), WORKBENCH_EXEC_COUNT_KEY: WORKBENCH_MAX_EXECUTIONS}
+    )
+    blocked = run_python_budget_guard(_TOOL, {}, _ctx(state))
+
+    assert blocked is not None
+    assert "executions" in str(blocked["stderr"])
+
+
+def test_a_foreign_tool_neither_charges_nor_snapshots() -> None:
+    state = _State({SessionKeys.MODEL_USAGE: _usage(9_000_000)})
+    other = type("T", (), {"name": "ghidra_decompile"})()
+
+    assert run_python_budget_guard(other, {}, _ctx(state)) is None
+    assert WORKBENCH_TOKEN_BASELINE_KEY not in state
+    assert WORKBENCH_EXEC_COUNT_KEY not in state
